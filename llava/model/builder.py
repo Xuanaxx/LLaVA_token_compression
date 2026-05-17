@@ -16,11 +16,35 @@
 import os
 import warnings
 import shutil
+import json
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, AutoImageProcessor, BitsAndBytesConfig
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+
+
+def _is_v35_flexiexit_checkpoint(model_path):
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    return bool(config.get("flexiexit") and config.get("enable_v35_prefill_compression"))
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"Cannot parse boolean value: {value!r}")
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
@@ -44,6 +68,39 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
+
+    learnable_prune_model = _coerce_bool(kwargs.pop("learnable_prune_model", False))
+    if learnable_prune_model:
+        from llava.model.learnable_prune import LlavaForConditionalGeneration, LlavaLearnablePruneOfficialAdapter
+
+        kwargs.pop("multimodal", None)
+        kwargs.pop("customized_config", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        image_processor = AutoImageProcessor.from_pretrained(model_path)
+        model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            low_cpu_mem_usage=True,
+            **kwargs
+        )
+        model = LlavaLearnablePruneOfficialAdapter(model, image_processor=image_processor)
+        context_len = getattr(model.config.text_config, "max_position_embeddings", 2048)
+        return tokenizer, model, image_processor, context_len
+
+    if _is_v35_flexiexit_checkpoint(model_path):
+        from llava.model.flexiexit_hybrid import LlavaForConditionalGeneration, LlavaV35FlexiExitOfficialAdapter
+
+        kwargs.pop("multimodal", None)
+        kwargs.pop("customized_config", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        image_processor = AutoImageProcessor.from_pretrained(model_path)
+        model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            low_cpu_mem_usage=True,
+            **kwargs
+        )
+        model = LlavaV35FlexiExitOfficialAdapter(model, image_processor=image_processor)
+        context_len = getattr(model.config.text_config, "max_position_embeddings", 2048)
+        return tokenizer, model, image_processor, context_len
 
     if 'llava' in model_name.lower():
         # Load LLaVA model
