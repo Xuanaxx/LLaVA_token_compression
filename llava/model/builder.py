@@ -70,6 +70,26 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         kwargs['attn_implementation'] = 'flash_attention_2'
 
     learnable_prune_model = _coerce_bool(kwargs.pop("learnable_prune_model", False))
+    learnable_prune_scope_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_scope_finalwipe_model", False))
+    if learnable_prune_scope_finalwipe_model:
+        from llava.model.learnable_prune_scope_finalwipe import (
+            LlavaForConditionalGeneration,
+            LlavaLearnablePruneScopeFinalwipeOfficialAdapter,
+        )
+
+        kwargs.pop("multimodal", None)
+        kwargs.pop("customized_config", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        image_processor = AutoImageProcessor.from_pretrained(model_path)
+        model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            low_cpu_mem_usage=True,
+            **kwargs
+        )
+        model = LlavaLearnablePruneScopeFinalwipeOfficialAdapter(model, image_processor=image_processor)
+        context_len = getattr(model.config.text_config, "max_position_embeddings", 2048)
+        return tokenizer, model, image_processor, context_len
+
     if learnable_prune_model:
         from llava.model.learnable_prune import LlavaForConditionalGeneration, LlavaLearnablePruneOfficialAdapter
 
