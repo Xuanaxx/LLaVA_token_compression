@@ -27,6 +27,8 @@ class _LoadedHFVisionTower:
 class LlavaLearnablePruneOfficialAdapter(nn.Module):
     def __init__(self, model, image_processor=None):
         super().__init__()
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            model = model.to(dtype=torch.bfloat16)
         self.model = model
         self.image_processor = image_processor
 
@@ -124,6 +126,14 @@ class LlavaLearnablePruneOfficialAdapter(nn.Module):
             kwargs.pop("images", None)
         if getattr(self.model.config, "image_aspect_ratio", None) != "anyres":
             kwargs.pop("image_sizes", None)
+        pixel_values = kwargs.get("pixel_values")
+        if torch.is_tensor(pixel_values):
+            kwargs["pixel_values"] = pixel_values.to(device=self.device, dtype=self.dtype)
+        elif isinstance(pixel_values, list):
+            kwargs["pixel_values"] = [
+                value.to(device=self.device, dtype=self.dtype) if torch.is_tensor(value) else value
+                for value in pixel_values
+            ]
         return self._expand_image_token_inputs(kwargs)
 
     def forward(self, *args, **kwargs):
