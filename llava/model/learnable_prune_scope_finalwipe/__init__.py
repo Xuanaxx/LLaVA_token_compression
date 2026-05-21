@@ -1,4 +1,11 @@
 from .official_adapter import LlavaLearnablePruneScopeFinalwipeOfficialAdapter
-from .modeling_llava_learnable_prune_scope_finalwipe import LlavaForConditionalGeneration
+from .official_modeling import (
+    LlavaForConditionalGeneration,
+    LlavaLearnablePruneScopeFinalwipeForCausalLM,
+)
 
-__all__ = ["LlavaForConditionalGeneration", "LlavaLearnablePruneScopeFinalwipeOfficialAdapter"]
+__all__ = [
+    "LlavaForConditionalGeneration",
+    "LlavaLearnablePruneScopeFinalwipeForCausalLM",
+    "LlavaLearnablePruneScopeFinalwipeOfficialAdapter",
+]
