@@ -37,7 +37,7 @@ import tokenizers
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from transformers import Trainer, TrainingArguments
 from packaging import version
@@ -1730,7 +1730,8 @@ def main() -> None:
     if args.modeling_file:
         print("--modeling_file is ignored because this trainer uses official LlavaLlamaForCausalLM.")
 
-    config = LlavaConfig.from_pretrained(args.model_name_or_path)
+    config_dict, _ = PretrainedConfig.get_config_dict(args.model_name_or_path)
+    config = LlavaConfig(**config_dict)
     vision_tower_name = args.vision_tower or getattr(config, "mm_vision_tower", None)
     resolved_vision_tower = resolve_vision_tower_path(vision_tower_name)
     if resolved_vision_tower is not None:

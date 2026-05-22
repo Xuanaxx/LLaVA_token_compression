@@ -19,7 +19,7 @@ PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-$((BATCH_SIZE / (PER_DEVICE_BATCH_SIZE * NUM_GPUS)))}
 MAX_STEPS=${MAX_STEPS:--1}
 MAX_SAMPLES=${MAX_SAMPLES:-}
-SAMPLE_RATE=${SAMPLE_RATE:-0.1}
+SAMPLE_RATE=${SAMPLE_RATE:-0.2}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 BF16=${BF16:-true}
 FP16=${FP16:-false}
@@ -36,9 +36,9 @@ ENABLE_SCALE=${ENABLE_SCALE:-false}
 ENABLE_RSS=${ENABLE_RSS:-false}
 
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/data1/chenzixuan/model/liuhaotian/llava-v1.5-7b"}
-DATA_DIR=${DATA_DIR:-"/data1/czx/data/llava_1_5_mix665k_full"}
+DATA_DIR=${DATA_DIR:-"/data2/czx/data/llava_1_5_mix665k_full"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
-RUN_NAME=${RUN_NAME:-"official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr"}
+RUN_NAME=${RUN_NAME:-"official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr_sample0.2"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-"$OUTPUT_ROOT/$RUN_NAME/teacher_target_logs"}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}
 

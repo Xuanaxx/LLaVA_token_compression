@@ -7,9 +7,11 @@ from .official_modeling import (
     ENABLE_FINALWIPE,
     FINAL_WIPE_LAYER_IDX,
     LEARNABLE_TOPK,
+    MERGE_TARGET_COUNT,
+    RECOVER_LAYER_IDX,
     SCOPE_TARGET_COUNT,
     LlavaForConditionalGeneration,
-    LlavaLearnablePruneScopeFinalwipeForCausalLM,
+    LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM,
     SeededResidualSCOPE,
 )
 
@@ -18,8 +20,10 @@ __all__ = [
     "ENABLE_FINALWIPE",
     "FINAL_WIPE_LAYER_IDX",
     "LEARNABLE_TOPK",
+    "MERGE_TARGET_COUNT",
+    "RECOVER_LAYER_IDX",
     "SCOPE_TARGET_COUNT",
     "LlavaForConditionalGeneration",
-    "LlavaLearnablePruneScopeFinalwipeForCausalLM",
+    "LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM",
     "SeededResidualSCOPE",
 ]

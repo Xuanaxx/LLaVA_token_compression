@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding: utf-8
-"""Official LLaVA learnable-prune + SeededResidualSCOPE + final-wipe inference."""
+"""Official LLaVA learnable-prune + SCOPE recover + final-wipe inference."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -110,21 +111,21 @@ def SeededResidualSCOPE(
     return selected.nonzero(as_tuple=False).flatten().sort().values.unsqueeze(0), cosine_simi
 
 
-class LlavaLearnablePruneScopeFinalwipeModel(LlavaLlamaModel):
+class LlavaLearnablePruneScopeRecoverFinalwipeModel(LlavaLlamaModel):
     config_class = LlavaConfig
 
 
-class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
+class LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM(LlavaLlamaForCausalLM):
     config_class = LlavaConfig
 
     def __init__(self, config):
         super(LlavaLlamaForCausalLM, self).__init__(config)
-        self.model = LlavaLearnablePruneScopeFinalwipeModel(config)
+        self.model = LlavaLearnablePruneScopeRecoverFinalwipeModel(config)
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self._scope_finalwipe_applied = False
-        self._scope_finalwipe_next_position_id = None
+        self._scope_recover_finalwipe_applied = False
+        self._scope_recover_finalwipe_next_position_id = None
         self.post_init()
 
     def get_model(self):
@@ -192,6 +193,50 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                     setattr(cache, attr, int(seen_tokens))
                 except Exception:
                     pass
+
+    @staticmethod
+    def _cluster_supplement_tokens_for_recover(
+        visual_embeds: torch.Tensor,
+        supplement_relative: torch.Tensor,
+        merge_target_count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if supplement_relative.numel() == 0:
+            empty_visual = visual_embeds[:, :0, :]
+            empty_idx = supplement_relative.new_empty((0,))
+            return empty_visual, empty_idx, empty_idx
+
+        supplement_visual = visual_embeds.index_select(1, supplement_relative)
+        supplement_count = int(supplement_visual.shape[1])
+        merge_count = min(max(int(merge_target_count), 1), supplement_count)
+        if supplement_count <= merge_count:
+            child_to_parent = torch.arange(supplement_count, dtype=torch.long, device=visual_embeds.device)
+            return supplement_visual, supplement_relative, child_to_parent
+
+        normed = F.normalize(supplement_visual[0].float(), p=2, dim=-1)
+        sim = torch.matmul(normed, normed.transpose(0, 1))
+        centers = [int(sim.mean(dim=1).argmax().item())]
+        while len(centers) < merge_count:
+            selected = torch.tensor(centers, dtype=torch.long, device=visual_embeds.device)
+            max_sim_to_selected = sim.index_select(1, selected).max(dim=1).values
+            max_sim_to_selected[selected] = float("inf")
+            centers.append(int(max_sim_to_selected.argmin().item()))
+
+        center_local = torch.tensor(centers, dtype=torch.long, device=visual_embeds.device)
+        center_sim = sim.index_select(1, center_local)
+        child_to_parent = center_sim.argmax(dim=1).to(dtype=torch.long)
+        child_to_parent[center_local] = torch.arange(merge_count, dtype=torch.long, device=visual_embeds.device)
+
+        pooled = []
+        for cluster_idx, center_idx in enumerate(centers):
+            member_mask = child_to_parent.eq(cluster_idx)
+            member_indices = member_mask.nonzero(as_tuple=False).flatten()
+            if member_indices.numel() == 0:
+                member_indices = center_local.new_tensor([center_idx])
+                child_to_parent[member_indices] = cluster_idx
+            weights = torch.softmax(sim[member_indices, center_idx], dim=0).to(dtype=supplement_visual.dtype)
+            pooled.append((supplement_visual[:, member_indices, :] * weights.view(1, -1, 1)).sum(dim=1, keepdim=True))
+
+        return torch.cat(pooled, dim=1), supplement_relative.index_select(0, center_local), child_to_parent
 
     def _embed_multimodal_for_generation(
         self,
@@ -295,9 +340,9 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         if input_ids.shape[0] != 1:
-            raise ValueError("learnable-prune scope-finalwipe generation currently expects batch_size=1")
+            raise ValueError("learnable-prune scope-recover-finalwipe generation currently expects batch_size=1")
         self._ensure_learnable_prune_loaded()
 
         if attention_mask is None:
@@ -314,7 +359,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         visual_positions = visual_token_mask[0].nonzero(as_tuple=False).flatten()
         if visual_positions.numel() == 0:
             valid_positions = attention_mask[0].bool().nonzero(as_tuple=False).flatten()
-            return inputs_embeds, input_ids[:, valid_positions], attention_mask, position_ids, valid_positions.unsqueeze(0)
+            return inputs_embeds, input_ids[:, valid_positions], attention_mask, position_ids, None
 
         predictor = self.learnable_prune_predictor
         predictor_dtype = next(predictor.parameters()).dtype
@@ -326,43 +371,224 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         )[0]
         learnable_topk = int(getattr(self, "learnable_prune_keep_k", LEARNABLE_TOPK))
         topk = min(learnable_topk, int(scores.numel()))
-        top_relative = torch.topk(scores, k=topk).indices if topk > 0 else scores.new_empty((0,), dtype=torch.long)
+        top_relative = torch.topk(scores, k=topk).indices.sort().values if topk > 0 else scores.new_empty((0,), dtype=torch.long)
 
         target_keep = min(SCOPE_TARGET_COUNT, int(scores.numel()))
+        visual_embeds = inputs_embeds.index_select(1, visual_positions)
         if target_keep > topk:
-            visual_embeds = inputs_embeds.index_select(1, visual_positions)
             seeded_scope_rank, _ = SeededResidualSCOPE(
                 visual_feature_vectors=visual_embeds.to(dtype=torch.float32),
                 seed_relative=top_relative,
                 target_keep=target_keep,
                 spatial_bonus=0.0,
             )
-            visual_keep_relative = seeded_scope_rank[0]
+            scope_relative = seeded_scope_rank[0]
         else:
-            visual_keep_relative = top_relative[:target_keep].sort().values
+            scope_relative = top_relative[:target_keep].sort().values
 
-        visual_keep = visual_positions.index_select(0, visual_keep_relative)
-        keep_mask = valid_mask[0].clone()
-        keep_mask[visual_positions] = False
-        keep_mask[visual_keep] = True
-        keep_positions = keep_mask.nonzero(as_tuple=False).flatten()
-        pruned_embeds = inputs_embeds[:, keep_positions, :]
-        pruned_input_ids = input_ids[:, keep_positions]
-        pruned_attention_mask = attention_mask.new_ones((1, keep_positions.numel()))
-        pruned_position_ids = position_ids[:, keep_positions]
+        in_top = torch.zeros(scores.numel(), dtype=torch.bool, device=scores.device)
+        if top_relative.numel() > 0:
+            in_top[top_relative] = True
+        supplement_relative = scope_relative[~in_top.index_select(0, scope_relative)]
+
+        top_visual = visual_embeds.index_select(1, top_relative) if top_relative.numel() > 0 else visual_embeds[:, :0, :]
+        supplement_visual = (
+            visual_embeds.index_select(1, supplement_relative)
+            if supplement_relative.numel() > 0
+            else visual_embeds[:, :0, :]
+        )
+        (
+            supplement_parent_visual,
+            supplement_center_relative,
+            supplement_child_to_parent,
+        ) = self._cluster_supplement_tokens_for_recover(
+            visual_embeds=visual_embeds,
+            supplement_relative=supplement_relative,
+            merge_target_count=MERGE_TARGET_COUNT,
+        )
+
+        parent_visual = torch.cat([top_visual, supplement_parent_visual], dim=1)
+        child_hidden_at_merge = torch.cat([top_visual, supplement_visual], dim=1)
+        top_child_to_parent = torch.arange(top_visual.shape[1], dtype=torch.long, device=input_ids.device)
+        child_to_parent = torch.cat([top_child_to_parent, top_visual.shape[1] + supplement_child_to_parent], dim=0)
+        calibration_child_indices = top_child_to_parent
+
+        image_start_idx = int(visual_positions[0].item())
+        image_end_idx = int(visual_positions[-1].item()) + 1
+        valid_positions = attention_mask[0].bool().nonzero(as_tuple=False).flatten()
+        pre_positions = valid_positions[valid_positions < image_start_idx]
+        post_positions = valid_positions[valid_positions >= image_end_idx]
+        compact_visual_relative = torch.cat([top_relative, supplement_center_relative], dim=0)
+        scope_visual_relative = torch.cat([top_relative, supplement_relative], dim=0)
+        compact_visual_positions = visual_positions.index_select(0, compact_visual_relative)
+        scope_visual_positions = visual_positions.index_select(0, scope_visual_relative)
+
+        compact_keep_positions = torch.cat([pre_positions, compact_visual_positions, post_positions], dim=0)
+        scope_keep_positions = torch.cat([pre_positions, scope_visual_positions, post_positions], dim=0)
+        compact_embeds = torch.cat(
+            [
+                inputs_embeds.index_select(1, pre_positions),
+                parent_visual,
+                inputs_embeds.index_select(1, post_positions),
+            ],
+            dim=1,
+        )
+        compact_input_ids = torch.cat(
+            [
+                input_ids.index_select(1, pre_positions),
+                input_ids.new_full((1, parent_visual.shape[1]), IMAGE_TOKEN_INDEX),
+                input_ids.index_select(1, post_positions),
+            ],
+            dim=1,
+        )
+        compact_attention_mask = attention_mask.new_ones((1, compact_embeds.shape[1]))
+        compact_position_ids = torch.cat(
+            [
+                position_ids.index_select(1, pre_positions),
+                position_ids.index_select(1, compact_visual_positions),
+                position_ids.index_select(1, post_positions),
+            ],
+            dim=1,
+        )
+
+        recovered_input_ids = torch.cat(
+            [
+                input_ids.index_select(1, pre_positions),
+                input_ids.new_full((1, child_hidden_at_merge.shape[1]), IMAGE_TOKEN_INDEX),
+                input_ids.index_select(1, post_positions),
+            ],
+            dim=1,
+        )
+        recovered_position_ids = torch.cat(
+            [
+                position_ids.index_select(1, pre_positions),
+                position_ids.index_select(1, scope_visual_positions),
+                position_ids.index_select(1, post_positions),
+            ],
+            dim=1,
+        )
+        recovered_attention_mask = attention_mask.new_ones((1, recovered_input_ids.shape[1]))
+        recover_state = {
+            "image_start_idx": torch.tensor(image_start_idx, dtype=torch.long, device=input_ids.device),
+            "compact_image_end_idx": torch.tensor(image_start_idx + parent_visual.shape[1], dtype=torch.long, device=input_ids.device),
+            "recovered_image_end_idx": torch.tensor(image_start_idx + child_hidden_at_merge.shape[1], dtype=torch.long, device=input_ids.device),
+            "parent_hidden_at_merge": parent_visual.detach(),
+            "child_hidden_at_merge": child_hidden_at_merge.detach(),
+            "child_to_parent": child_to_parent.detach(),
+            "calibration_child_indices": calibration_child_indices.detach(),
+            "recovered_input_ids": recovered_input_ids,
+            "recovered_attention_mask": recovered_attention_mask,
+            "recovered_position_ids": recovered_position_ids,
+            "recovered_keep_positions": scope_keep_positions.unsqueeze(0),
+            "compact_keep_positions": compact_keep_positions.unsqueeze(0),
+        }
         self.learnable_prune_stats.append(
             {
                 "original_tokens": int(input_ids.shape[1]),
                 "original_visual_tokens": int(visual_positions.numel()),
                 "learnable_topk_visual_tokens": int(topk),
-                "kept_visual_tokens": int(visual_keep.numel()),
+                "scope_visual_tokens": int(scope_relative.numel()),
+                "supplement_visual_tokens": int(supplement_relative.numel()),
+                "merged_supplement_visual_tokens": int(supplement_parent_visual.shape[1]),
+                "kept_visual_tokens_before_recover": int(parent_visual.shape[1]),
                 "scope_target_visual_tokens": int(target_keep),
                 "diversity_fill_method": "seeded_residual_scope",
-                "pruned_tokens": int(input_ids.shape[1] - keep_positions.numel()),
+                "supplement_merge_method": "similarity_center_softmax_pool",
+                "pruned_tokens": int(input_ids.shape[1] - compact_keep_positions.numel()),
                 "checkpoint": getattr(self, "learnable_prune_checkpoint", None),
             }
         )
-        return pruned_embeds, pruned_input_ids, pruned_attention_mask, pruned_position_ids, keep_positions.unsqueeze(0)
+        return compact_embeds, compact_input_ids, compact_attention_mask, compact_position_ids, recover_state
+
+    def _estimate_recover_per_head_gamma(
+        self,
+        current_visual: torch.Tensor,
+        parent_hidden_at_merge: torch.Tensor,
+        child_to_parent: torch.LongTensor,
+        child_hidden_at_merge: torch.Tensor,
+        calibration_child_indices: Optional[torch.LongTensor] = None,
+        min_calib_groups: int = 4,
+    ) -> Optional[torch.Tensor]:
+        del parent_hidden_at_merge
+        if current_visual.size(0) != 1 or child_hidden_at_merge.size(0) != 1:
+            return None
+        hidden_size = int(child_hidden_at_merge.size(-1))
+        num_heads = int(getattr(self.config, "num_attention_heads", 1))
+        if num_heads <= 0 or hidden_size % num_heads != 0:
+            return None
+        if calibration_child_indices is None or calibration_child_indices.numel() < 4 * min_calib_groups:
+            return None
+
+        calibration_child_indices = calibration_child_indices.to(device=child_hidden_at_merge.device, dtype=torch.long)
+        calibration_child_indices = calibration_child_indices[
+            (calibration_child_indices >= 0) & (calibration_child_indices < child_hidden_at_merge.size(1))
+        ]
+        group_count = int(calibration_child_indices.numel()) // 4
+        if group_count < min_calib_groups:
+            return None
+        calibration_child_indices = calibration_child_indices[: group_count * 4].view(group_count, 4)
+        calibration_parent_indices = child_to_parent.index_select(0, calibration_child_indices.reshape(-1)).view(group_count, 4)
+
+        shallow_children = child_hidden_at_merge[:, calibration_child_indices.reshape(-1), :].view(group_count, 4, hidden_size)
+        deep_children = current_visual[:, calibration_parent_indices.reshape(-1), :].view(group_count, 4, hidden_size)
+
+        shallow_norm = F.normalize(shallow_children.float(), p=2, dim=-1)
+        sim_matrix = torch.matmul(shallow_norm, shallow_norm.transpose(1, 2))
+        weights = torch.softmax(sim_matrix.mean(dim=-1), dim=1).to(dtype=child_hidden_at_merge.dtype)
+
+        shallow_center = (shallow_children * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        deep_center = (deep_children * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        head_dim = hidden_size // num_heads
+        shallow_dev = (shallow_children - shallow_center).float().view(-1, num_heads, head_dim)
+        deep_dev = (deep_children - deep_center).float().view(-1, num_heads, head_dim)
+
+        denominator = shallow_dev.square().sum(dim=(0, 2)).clamp(min=1e-6)
+        numerator = (deep_dev * shallow_dev).sum(dim=(0, 2))
+        gamma = torch.nan_to_num(numerator / denominator, nan=1.0, posinf=1.0, neginf=1.0)
+        gamma = gamma.clamp(min=0.5, max=1.5)
+        return gamma.to(device=child_hidden_at_merge.device, dtype=child_hidden_at_merge.dtype)
+
+    def _recover_quadtree_children_from_residual(
+        self,
+        hidden_states: torch.Tensor,
+        image_start_idx: int,
+        image_end_idx: int,
+        parent_hidden_at_merge: torch.Tensor,
+        child_to_parent: torch.LongTensor,
+        child_hidden_at_merge: torch.Tensor,
+        calibration_child_indices: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        current_visual = hidden_states[:, image_start_idx:image_end_idx, :]
+        parent_current = current_visual.index_select(1, child_to_parent)
+        parent_at_merge = parent_hidden_at_merge.index_select(1, child_to_parent)
+        child_deviation = child_hidden_at_merge - parent_at_merge
+
+        gamma = self._estimate_recover_per_head_gamma(
+            current_visual=current_visual,
+            parent_hidden_at_merge=parent_hidden_at_merge,
+            child_to_parent=child_to_parent,
+            child_hidden_at_merge=child_hidden_at_merge,
+            calibration_child_indices=calibration_child_indices,
+        )
+        if gamma is not None:
+            hidden_size = int(child_deviation.size(-1))
+            num_heads = int(getattr(self.config, "num_attention_heads", 1))
+            if num_heads > 0 and hidden_size % num_heads == 0:
+                head_dim = hidden_size // num_heads
+                child_deviation = (
+                    child_deviation.view(child_deviation.size(0), child_deviation.size(1), num_heads, head_dim)
+                    * gamma.view(1, 1, num_heads, 1)
+                ).view_as(child_deviation)
+
+        recovered_visual = parent_current + child_deviation
+        return torch.cat(
+            [
+                hidden_states[:, :image_start_idx, :],
+                recovered_visual,
+                hidden_states[:, image_end_idx:, :],
+            ],
+            dim=1,
+        )
 
     def _wipe_visual_tokens(
         self,
@@ -531,7 +757,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         output_attentions: bool,
         output_hidden_states: bool,
     ):
-        inputs_embeds, scoped_input_ids, attention_mask, position_ids, scoped_keep_positions = self._learnable_scope_prune_prefill(
+        inputs_embeds, scoped_input_ids, attention_mask, position_ids, recover_state = self._learnable_scope_prune_prefill(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -539,37 +765,73 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         )
         layers = self.model.layers
         enable_finalwipe = _enable_finalwipe()
+        recover_layer_idx = min(RECOVER_LAYER_IDX, len(layers))
         wipe_layer_idx = min(FINAL_WIPE_LAYER_IDX, len(layers)) if enable_finalwipe else len(layers)
+        wipe_layer_idx = max(wipe_layer_idx, recover_layer_idx)
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
         next_cache = DynamicCache(config=self.model.config) if use_cache else None
 
-        pre_cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
-        pre_mask = self._prepare_mask(
-            attention_mask,
-            hidden_states,
-            position_ids=position_ids,
-            cache_position=pre_cache_position,
-        )
-        for layer_idx in range(wipe_layer_idx):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-            hidden_states, attn, present = self._run_layer(
-                layers[layer_idx],
-                hidden_states,
-                pre_mask,
-                position_ids,
-                past_key_value=next_cache,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                cache_position=pre_cache_position,
+        def _run_layer_span(
+            start_idx: int,
+            end_idx: int,
+            curr_hidden_states: torch.Tensor,
+            curr_attention_mask: torch.Tensor,
+            curr_position_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            nonlocal all_hidden_states, all_attns, next_cache
+            if start_idx >= end_idx:
+                return curr_hidden_states
+            curr_cache_position = torch.arange(curr_hidden_states.shape[1], device=curr_hidden_states.device, dtype=torch.long)
+            curr_mask = self._prepare_mask(
+                curr_attention_mask,
+                curr_hidden_states,
+                position_ids=curr_position_ids,
+                cache_position=curr_cache_position,
             )
-            if use_cache:
-                if isinstance(next_cache, list):
-                    next_cache.append(present)
-            if output_attentions:
-                all_attns = all_attns + (attn,)
+            for layer_idx in range(start_idx, end_idx):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (curr_hidden_states,)
+                curr_hidden_states, attn, present = self._run_layer(
+                    layers[layer_idx],
+                    curr_hidden_states,
+                    curr_mask,
+                    curr_position_ids,
+                    past_key_value=next_cache,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    cache_position=curr_cache_position,
+                )
+                if use_cache:
+                    if isinstance(next_cache, list):
+                        next_cache.append(present)
+                if output_attentions:
+                    all_attns = all_attns + (attn,)
+            return curr_hidden_states
+
+        hidden_states = _run_layer_span(0, recover_layer_idx, hidden_states, attention_mask, position_ids)
+
+        if recover_state is not None:
+            image_start_idx = int(recover_state["image_start_idx"].item())
+            compact_image_end_idx = int(recover_state["compact_image_end_idx"].item())
+            hidden_states = self._recover_quadtree_children_from_residual(
+                hidden_states=hidden_states,
+                image_start_idx=image_start_idx,
+                image_end_idx=compact_image_end_idx,
+                parent_hidden_at_merge=recover_state["parent_hidden_at_merge"],
+                child_to_parent=recover_state["child_to_parent"],
+                child_hidden_at_merge=recover_state["child_hidden_at_merge"],
+                calibration_child_indices=recover_state["calibration_child_indices"],
+            )
+            scoped_input_ids = recover_state["recovered_input_ids"]
+            attention_mask = recover_state["recovered_attention_mask"]
+            position_ids = recover_state["recovered_position_ids"]
+            scoped_keep_positions = recover_state["recovered_keep_positions"]
+        else:
+            scoped_keep_positions = torch.arange(scoped_input_ids.shape[1], device=scoped_input_ids.device).unsqueeze(0)
+
+        hidden_states = _run_layer_span(recover_layer_idx, wipe_layer_idx, hidden_states, attention_mask, position_ids)
 
         if enable_finalwipe:
             hidden_states, final_input_ids, final_attention_mask, final_position_ids, wiped_keep_positions = self._wipe_visual_tokens(
@@ -586,9 +848,12 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             final_position_ids = position_ids
             final_keep_positions = scoped_keep_positions
             final_wiped_visual_tokens = 0
+
         if getattr(self, "learnable_prune_stats", None):
             self.learnable_prune_stats[-1].update(
                 {
+                    "recover_layer_idx": int(recover_layer_idx),
+                    "recovered_visual_tokens": int(scoped_input_ids[0].eq(IMAGE_TOKEN_INDEX).sum().item()),
                     "enable_finalwipe": bool(enable_finalwipe),
                     "final_wipe_layer_idx": int(wipe_layer_idx),
                     "final_wiped_visual_tokens": int(final_wiped_visual_tokens),
@@ -596,41 +861,17 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                 }
             )
             if os.environ.get("LEARNABLE_PRUNE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
-                print(f"[learnable_prune_scope_finalwipe] stats={self.learnable_prune_stats[-1]}", flush=True)
+                print(f"[learnable_prune_scope_recover_finalwipe] stats={self.learnable_prune_stats[-1]}", flush=True)
 
-        post_cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
-        post_mask = self._prepare_mask(
-            final_attention_mask,
-            hidden_states,
-            position_ids=final_position_ids,
-            cache_position=post_cache_position,
-        )
-        for layer_idx in range(wipe_layer_idx, len(layers)):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-            hidden_states, attn, present = self._run_layer(
-                layers[layer_idx],
-                hidden_states,
-                post_mask,
-                final_position_ids,
-                past_key_value=next_cache,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                cache_position=post_cache_position,
-            )
-            if use_cache:
-                if isinstance(next_cache, list):
-                    next_cache.append(present)
-            if output_attentions:
-                all_attns = all_attns + (attn,)
+        hidden_states = _run_layer_span(wipe_layer_idx, len(layers), hidden_states, final_attention_mask, final_position_ids)
 
         hidden_states = self.model.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         if next_cache is not None:
             self._set_cache_seen_tokens(next_cache, hidden_states.size(1))
-        self._scope_finalwipe_applied = True
-        self._scope_finalwipe_next_position_id = int(input_ids.shape[1])
+        self._scope_recover_finalwipe_applied = True
+        self._scope_recover_finalwipe_next_position_id = int(input_ids.shape[1])
         return (
             hidden_states,
             (tuple(next_cache) if isinstance(next_cache, list) else next_cache),
@@ -687,8 +928,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
 
         is_initial_prefill_cache = self._is_initial_prefill_cache(past_key_values)
         if is_initial_prefill_cache:
-            self._scope_finalwipe_applied = False
-            self._scope_finalwipe_next_position_id = None
+            self._scope_recover_finalwipe_applied = False
+            self._scope_recover_finalwipe_next_position_id = None
 
         should_prune = (
             learnable_prune
@@ -720,7 +961,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                 output_attentions=bool(output_attentions),
                 output_hidden_states=bool(output_hidden_states),
             )
-        elif getattr(self, "_scope_finalwipe_applied", False) and past_key_values is not None:
+        elif getattr(self, "_scope_recover_finalwipe_applied", False) and past_key_values is not None:
             current_seq_len = inputs_embeds.shape[1]
             if position_ids is None:
                 if attention_mask is not None:
@@ -744,7 +985,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                 ).unsqueeze(0)
 
             decode_cache_position = position_ids.squeeze(0)
-            next_position_id = getattr(self, "_scope_finalwipe_next_position_id", None)
+            next_position_id = getattr(self, "_scope_recover_finalwipe_next_position_id", None)
             if next_position_id is not None:
                 position_ids = torch.arange(
                     int(next_position_id),
@@ -752,7 +993,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                     device=inputs_embeds.device,
                     dtype=torch.long,
                 ).unsqueeze(0)
-                self._scope_finalwipe_next_position_id = int(next_position_id) + current_seq_len
+                self._scope_recover_finalwipe_next_position_id = int(next_position_id) + current_seq_len
             elif cache_position is not None:
                 position_ids = cache_position.unsqueeze(0)
             hidden_states, past_key_values, all_hidden_states, all_attns = self._manual_decode(
@@ -876,4 +1117,4 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         )
 
 
-LlavaForConditionalGeneration = LlavaLearnablePruneScopeFinalwipeForCausalLM
+LlavaForConditionalGeneration = LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM

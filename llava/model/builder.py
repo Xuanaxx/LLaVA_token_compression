@@ -17,8 +17,9 @@ import os
 import warnings
 import shutil
 import json
+from pathlib import Path
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, AutoImageProcessor, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, AutoImageProcessor, BitsAndBytesConfig, PretrainedConfig
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -47,7 +48,43 @@ def _coerce_bool(value):
     raise ValueError(f"Cannot parse boolean value: {value!r}")
 
 
+def _resolve_torch_dtype(dtype):
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        dtype = dtype.strip()
+        if dtype == "auto":
+            return "auto"
+        if hasattr(torch, dtype):
+            return getattr(torch, dtype)
+    raise ValueError(f"Cannot parse torch dtype: {dtype!r}")
+
+
+def _resolve_vision_tower_path(vision_tower):
+    if not vision_tower or os.path.exists(vision_tower):
+        return vision_tower
+    env_path = os.environ.get("LLAVA_VISION_TOWER")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    cache_candidates = [
+        Path.home() / ".cache/huggingface/hub",
+        Path.home() / ".cache/huggingface/transformers",
+        Path("/data1/zx/.cache/huggingface/transformers"),
+        Path("/data1/zx/.cache/huggingface/hub"),
+    ]
+    repo_dir_name = f"models--{vision_tower.replace('/', '--')}"
+    for cache_root in cache_candidates:
+        snapshots_dir = cache_root / repo_dir_name / "snapshots"
+        if not snapshots_dir.is_dir():
+            continue
+        snapshots = sorted(path for path in snapshots_dir.iterdir() if (path / "config.json").exists())
+        if snapshots:
+            return str(snapshots[-1])
+    return vision_tower
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
+    requested_dtype = _resolve_torch_dtype(kwargs.pop("dtype", kwargs.get("torch_dtype", None)))
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
@@ -64,21 +101,29 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['torch_dtype'] = torch.float16
+        kwargs['torch_dtype'] = requested_dtype if requested_dtype is not None else torch.float16
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
 
     learnable_prune_model = _coerce_bool(kwargs.pop("learnable_prune_model", False))
     learnable_prune_scope_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_scope_finalwipe_model", False))
-    if learnable_prune_scope_finalwipe_model:
-        from llava.model.learnable_prune_scope_finalwipe import LlavaLearnablePruneScopeFinalwipeForCausalLM
+    learnable_prune_scope_recover_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_scope_recover_finalwipe_model", False))
+    if learnable_prune_scope_recover_finalwipe_model:
+        from llava.model.learnable_prune_scope_recover_finalwipe import LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM
+        from llava.model.language_model.llava_llama import LlavaConfig
 
         kwargs.pop("multimodal", None)
         kwargs.pop("customized_config", None)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        model = LlavaLearnablePruneScopeFinalwipeForCausalLM.from_pretrained(
+        config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+        config = LlavaConfig(**config_dict)
+        resolved_vision_tower = _resolve_vision_tower_path(getattr(config, "mm_vision_tower", None))
+        if resolved_vision_tower is not None:
+            config.mm_vision_tower = resolved_vision_tower
+        model = LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM.from_pretrained(
             model_path,
+            config=config,
             low_cpu_mem_usage=True,
             **kwargs
         )
@@ -93,7 +138,52 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
-        if device_map != "auto":
+        if isinstance(requested_dtype, torch.dtype):
+            if device_map != "auto":
+                vision_tower.to(device=device_map, dtype=requested_dtype)
+            else:
+                vision_tower.to(dtype=requested_dtype)
+        elif device_map != "auto":
+            vision_tower.to(device=device_map, dtype=torch.float16)
+        image_processor = vision_tower.image_processor
+        context_len = getattr(model.config, "max_sequence_length", getattr(model.config, "max_position_embeddings", 2048))
+        return tokenizer, model, image_processor, context_len
+
+    if learnable_prune_scope_finalwipe_model:
+        from llava.model.learnable_prune_scope_finalwipe import LlavaLearnablePruneScopeFinalwipeForCausalLM
+        from llava.model.language_model.llava_llama import LlavaConfig
+
+        kwargs.pop("multimodal", None)
+        kwargs.pop("customized_config", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+        config = LlavaConfig(**config_dict)
+        resolved_vision_tower = _resolve_vision_tower_path(getattr(config, "mm_vision_tower", None))
+        if resolved_vision_tower is not None:
+            config.mm_vision_tower = resolved_vision_tower
+        model = LlavaLearnablePruneScopeFinalwipeForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            low_cpu_mem_usage=True,
+            **kwargs
+        )
+        mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+        if mm_use_im_patch_token:
+            tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+        if mm_use_im_start_end:
+            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        model.resize_token_embeddings(len(tokenizer))
+
+        vision_tower = model.get_vision_tower()
+        if not vision_tower.is_loaded:
+            vision_tower.load_model(device_map=device_map)
+        if isinstance(requested_dtype, torch.dtype):
+            if device_map != "auto":
+                vision_tower.to(device=device_map, dtype=requested_dtype)
+            else:
+                vision_tower.to(dtype=requested_dtype)
+        elif device_map != "auto":
             vision_tower.to(device=device_map, dtype=torch.float16)
         image_processor = vision_tower.image_processor
         context_len = getattr(model.config, "max_sequence_length", getattr(model.config, "max_position_embeddings", 2048))
