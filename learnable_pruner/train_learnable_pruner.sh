@@ -7,14 +7,14 @@ fi
 source /data1/chenzixuan/uv_env/.tokencompression/bin/activate
 cd /data1/chenzixuan/open_source_projects/LLaVA_token_compression/learnable_pruner
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-"expandable_segments:True"}
 export WANDB_PROJECT=${WANDB_PROJECT:-"llava_learnable_prune_dynamic_kl"}
 export WANDB_API_KEY="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"
 
 BATCH_SIZE=${BATCH_SIZE:-32}
-NUM_GPUS=${NUM_GPUS:-4}
+NUM_GPUS=${NUM_GPUS:-2}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-$((BATCH_SIZE / (PER_DEVICE_BATCH_SIZE * NUM_GPUS)))}
 MAX_STEPS=${MAX_STEPS:--1}
@@ -38,7 +38,7 @@ ENABLE_RSS=${ENABLE_RSS:-false}
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/data1/chenzixuan/model/liuhaotian/llava-v1.5-7b"}
 DATA_DIR=${DATA_DIR:-"/data2/czx/data/llava_1_5_mix665k_full"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
-RUN_NAME=${RUN_NAME:-"official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr_sample0.2"}
+RUN_NAME=${RUN_NAME:-"official_llava_learnable_prune_precision_at_k_hinge_top96_layers16_24_top1_iqr_sample0.2"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-"$OUTPUT_ROOT/$RUN_NAME/teacher_target_logs"}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}
 
@@ -70,7 +70,7 @@ accelerate launch "${ACCELERATE_ARGS[@]}" train_learnable_pruner.py \
   --output_dir "$OUTPUT_ROOT/$RUN_NAME" \
   --run_name "$RUN_NAME" \
   --wandb_project "$WANDB_PROJECT" \
-  --keep_k 64 \
+  --keep_k 96 \
   --candidate_layers "16-24" \
   --predictor_hidden_size 512 \
   --predictor_heads 8 \

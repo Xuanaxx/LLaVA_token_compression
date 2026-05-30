@@ -25,12 +25,12 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM, LlavaLlamaModel
 
 
-DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr"
+DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr_sample0.2"
 LEARNABLE_TOPK = 64
 MERGE_TARGET_COUNT = 4
-SCOPE_TARGET_COUNT = 100
-RECOVER_LAYER_IDX = 14
-FINAL_WIPE_LAYER_IDX = 25
+SCOPE_TARGET_COUNT = 103
+RECOVER_LAYER_IDX = 12
+FINAL_WIPE_LAYER_IDX = 24
 ENABLE_FINALWIPE = True
 
 
@@ -41,8 +41,27 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value.strip())
+
+
 def _enable_finalwipe() -> bool:
     return _env_flag("ENABLE_FINALWIPE", ENABLE_FINALWIPE)
+
+
+def _scope_target_count() -> int:
+    return _env_int("SCOPE_TARGET_COUNT", SCOPE_TARGET_COUNT)
+
+
+def _recover_layer_idx() -> int:
+    return _env_int("RECOVER_LAYER_IDX", RECOVER_LAYER_IDX)
+
+
+def _final_wipe_layer_idx() -> int:
+    return _env_int("FINAL_WIPE_LAYER_IDX", FINAL_WIPE_LAYER_IDX)
 
 
 @torch.no_grad()
@@ -373,7 +392,7 @@ class LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM(LlavaLlamaForCausalLM)
         topk = min(learnable_topk, int(scores.numel()))
         top_relative = torch.topk(scores, k=topk).indices.sort().values if topk > 0 else scores.new_empty((0,), dtype=torch.long)
 
-        target_keep = min(SCOPE_TARGET_COUNT, int(scores.numel()))
+        target_keep = min(_scope_target_count(), int(scores.numel()))
         visual_embeds = inputs_embeds.index_select(1, visual_positions)
         if target_keep > topk:
             seeded_scope_rank, _ = SeededResidualSCOPE(
@@ -765,8 +784,8 @@ class LlavaLearnablePruneScopeRecoverFinalwipeForCausalLM(LlavaLlamaForCausalLM)
         )
         layers = self.model.layers
         enable_finalwipe = _enable_finalwipe()
-        recover_layer_idx = min(RECOVER_LAYER_IDX, len(layers))
-        wipe_layer_idx = min(FINAL_WIPE_LAYER_IDX, len(layers)) if enable_finalwipe else len(layers)
+        recover_layer_idx = min(_recover_layer_idx(), len(layers))
+        wipe_layer_idx = min(_final_wipe_layer_idx(), len(layers)) if enable_finalwipe else len(layers)
         wipe_layer_idx = max(wipe_layer_idx, recover_layer_idx)
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None

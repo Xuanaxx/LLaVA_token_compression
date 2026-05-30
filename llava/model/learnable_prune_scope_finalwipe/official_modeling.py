@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, apply_rotary_pos_emb
 
 try:
     from transformers.models.llama.modeling_llama import create_causal_mask as llama_create_causal_mask
@@ -24,13 +24,15 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM, LlavaLlamaModel
 
 
-DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_precision_at_k_hinge_top64_layers16_24_top1_iqr"
-LEARNABLE_TOPK = 64
-MERGE_TARGET_COUNT = 4
-SCOPE_TARGET_COUNT = 100
-RECOVER_LAYER_IDX = 14
-FINAL_WIPE_LAYER_IDX = 25
+DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_precision_at_k_hinge_top96_layers16_24_top1_iqr_sample0.2"
+LEARNABLE_TOPK = 96
+SCOPE_TARGET_COUNT = 107
+MID_PRUNING_LAYER_IDX = 12
+MID_TARGET_COUNT = 64
+MID_ATTN_ANCHOR = "query"
+FINAL_WIPE_LAYER_IDX = 24
 ENABLE_FINALWIPE = True
+ENABLE_PREDICTOR = True
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -40,8 +42,32 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return int(default)
+    return int(value)
+
+
 def _enable_finalwipe() -> bool:
     return _env_flag("ENABLE_FINALWIPE", ENABLE_FINALWIPE)
+
+
+def _enable_predictor() -> bool:
+    return _env_flag("ENABLE_PREDICTOR", ENABLE_PREDICTOR)
+
+
+def _mid_target_count(default: Optional[int] = None) -> int:
+    base = MID_TARGET_COUNT if default is None else int(default)
+    return _env_int("MID_TARGET_COUNT", base)
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    bsz, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(bsz, num_key_value_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(bsz, num_key_value_heads * n_rep, seq_len, head_dim)
 
 
 @torch.no_grad()
@@ -298,7 +324,11 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if input_ids.shape[0] != 1:
             raise ValueError("learnable-prune scope-finalwipe generation currently expects batch_size=1")
-        self._ensure_learnable_prune_loaded()
+        enable_predictor = _enable_predictor()
+        if enable_predictor:
+            self._ensure_learnable_prune_loaded()
+        elif not hasattr(self, "learnable_prune_stats"):
+            self.learnable_prune_stats = []
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -316,19 +346,24 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             valid_positions = attention_mask[0].bool().nonzero(as_tuple=False).flatten()
             return inputs_embeds, input_ids[:, valid_positions], attention_mask, position_ids, valid_positions.unsqueeze(0)
 
-        predictor = self.learnable_prune_predictor
-        predictor_dtype = next(predictor.parameters()).dtype
         text_positions = (valid_mask & ~visual_token_mask)[0].nonzero(as_tuple=False).flatten()
-        scores = predictor.score_visual_text_by_positions(
-            inputs_embeds.to(dtype=predictor_dtype),
-            visual_positions=visual_positions,
-            text_positions=text_positions,
-        )[0]
-        learnable_topk = int(getattr(self, "learnable_prune_keep_k", LEARNABLE_TOPK))
-        topk = min(learnable_topk, int(scores.numel()))
-        top_relative = torch.topk(scores, k=topk).indices if topk > 0 else scores.new_empty((0,), dtype=torch.long)
+        if enable_predictor:
+            predictor = self.learnable_prune_predictor
+            predictor_dtype = next(predictor.parameters()).dtype
+            scores = predictor.score_visual_text_by_positions(
+                inputs_embeds.to(dtype=predictor_dtype),
+                visual_positions=visual_positions,
+                text_positions=text_positions,
+            )[0]
+            learnable_topk = int(getattr(self, "learnable_prune_keep_k", LEARNABLE_TOPK))
+            topk = min(learnable_topk, int(scores.numel()))
+            top_relative = torch.topk(scores, k=topk).indices if topk > 0 else scores.new_empty((0,), dtype=torch.long)
+        else:
+            scores = inputs_embeds.new_empty((visual_positions.numel(),), dtype=torch.float32)
+            topk = 0
+            top_relative = torch.empty((0,), dtype=torch.long, device=visual_positions.device)
 
-        target_keep = min(SCOPE_TARGET_COUNT, int(scores.numel()))
+        target_keep = min(SCOPE_TARGET_COUNT, int(visual_positions.numel()))
         if target_keep > topk:
             visual_embeds = inputs_embeds.index_select(1, visual_positions)
             seeded_scope_rank, _ = SeededResidualSCOPE(
@@ -354,6 +389,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             {
                 "original_tokens": int(input_ids.shape[1]),
                 "original_visual_tokens": int(visual_positions.numel()),
+                "enable_predictor": bool(enable_predictor),
                 "learnable_topk_visual_tokens": int(topk),
                 "kept_visual_tokens": int(visual_keep.numel()),
                 "scope_target_visual_tokens": int(target_keep),
@@ -363,6 +399,110 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             }
         )
         return pruned_embeds, pruned_input_ids, pruned_attention_mask, pruned_position_ids, keep_positions.unsqueeze(0)
+
+    def _build_mid_query_indices(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        visual_positions: torch.Tensor,
+        attn_anchor: str,
+    ) -> torch.Tensor:
+        valid_text_positions = (attention_mask[0].bool() & input_ids[0].ne(IMAGE_TOKEN_INDEX)).nonzero(as_tuple=False).flatten()
+        if valid_text_positions.numel() == 0:
+            return attention_mask[0].bool().nonzero(as_tuple=False).flatten()[-1:]
+        if attn_anchor == "query" and visual_positions.numel() > 0:
+            query_positions = valid_text_positions[valid_text_positions > visual_positions.max()]
+            if query_positions.numel() > 0:
+                return query_positions
+        return valid_text_positions[-1:]
+
+    def _get_visual_token_attention_scores(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        scoring_layer_idx: int,
+        visual_positions: torch.Tensor,
+        query_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        layers = self.model.layers
+        scoring_layer = layers[scoring_layer_idx]
+        self_attn = scoring_layer.self_attn
+        bsz, seq_len, hidden_size = hidden_states.shape
+        if bsz != 1:
+            raise ValueError("Importance scoring expects a single sample.")
+        if visual_positions.numel() == 0 or query_indices.numel() == 0:
+            return hidden_states.new_zeros((0, visual_positions.numel()))
+
+        hidden_normed = scoring_layer.input_layernorm(hidden_states)
+        num_heads = getattr(self_attn.config, "num_attention_heads", None)
+        if num_heads is None:
+            num_heads = getattr(self_attn, "num_heads")
+        num_heads = int(num_heads)
+        num_kv_heads = int(getattr(self_attn.config, "num_key_value_heads", num_heads))
+        head_dim = int(self_attn.head_dim)
+        scaling = float(getattr(self_attn, "scaling", head_dim ** -0.5))
+
+        query_states = self_attn.q_proj(hidden_normed).view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
+        key_states = self_attn.k_proj(hidden_normed).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        value_states = self_attn.v_proj(hidden_normed).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        cos, sin = self.model.rotary_emb(hidden_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
+        value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
+
+        q_idx = query_indices.to(dtype=torch.long, device=hidden_states.device)
+        visual_positions = visual_positions.to(dtype=torch.long, device=hidden_states.device)
+        key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+        key_valid = attention_mask[:, None, None, :].bool()
+        v_visual = value_states.index_select(2, visual_positions)[0]
+        query_chunk_size = 8
+        score_chunks: List[torch.Tensor] = []
+        for q_chunk in q_idx.split(query_chunk_size):
+            q_states = query_states.index_select(2, q_chunk)
+            attn_scores = torch.matmul(q_states, key_states.transpose(2, 3)) * scaling
+            causal = key_positions <= q_chunk.view(1, 1, -1, 1)
+            attn_scores = attn_scores.float().masked_fill(~(causal & key_valid), torch.finfo(torch.float32).min)
+            attn_probs = torch.softmax(attn_scores, dim=-1).to(dtype=q_states.dtype)
+            z_heads = torch.matmul(attn_probs, value_states)[0].permute(1, 0, 2).contiguous()
+
+            alpha_visual = attn_probs.index_select(-1, visual_positions)[0].permute(1, 0, 2).contiguous()
+            beta = alpha_visual / (1.0 - alpha_visual).clamp(min=1e-6)
+            delta_z = beta.unsqueeze(-1) * (z_heads.unsqueeze(2) - v_visual.unsqueeze(0))
+            delta_z_cat = delta_z.permute(0, 2, 1, 3).contiguous().view(-1, num_heads * head_dim)
+            delta_y = self_attn.o_proj(delta_z_cat).view(q_chunk.numel(), -1, hidden_size)
+            score_chunks.append(delta_y.norm(dim=-1))
+        if not score_chunks:
+            return hidden_states.new_zeros((0, visual_positions.numel()))
+        return torch.cat(score_chunks, dim=0)
+
+    def _prune_by_mid_attention_scores(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        importance_scores: torch.Tensor,
+        target_count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        visual_positions = input_ids[0].eq(IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+        target_count = min(max(int(target_count), 0), int(visual_positions.numel()))
+        if visual_positions.numel() > target_count:
+            keep_mask = input_ids[0].ne(IMAGE_TOKEN_INDEX)
+            if target_count > 0:
+                top_relative = torch.topk(importance_scores, k=target_count).indices.sort().values
+                visual_keep = visual_positions.index_select(0, top_relative)
+                keep_mask[visual_keep] = True
+            keep_positions = keep_mask.nonzero(as_tuple=False).flatten()
+        else:
+            keep_positions = attention_mask[0].bool().nonzero(as_tuple=False).flatten()
+        return (
+            hidden_states.index_select(1, keep_positions),
+            input_ids.index_select(1, keep_positions),
+            attention_mask.index_select(1, keep_positions),
+            position_ids.index_select(1, keep_positions),
+            keep_positions.unsqueeze(0),
+        )
 
     def _wipe_visual_tokens(
         self,
@@ -530,6 +670,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         use_cache: bool,
         output_attentions: bool,
         output_hidden_states: bool,
+        attn_anchor: str = MID_ATTN_ANCHOR,
+        mid_target_count: Optional[int] = None,
     ):
         inputs_embeds, scoped_input_ids, attention_mask, position_ids, scoped_keep_positions = self._learnable_scope_prune_prefill(
             input_ids=input_ids,
@@ -540,6 +682,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         layers = self.model.layers
         enable_finalwipe = _enable_finalwipe()
         wipe_layer_idx = min(FINAL_WIPE_LAYER_IDX, len(layers)) if enable_finalwipe else len(layers)
+        mid_pruning_layer_idx = min(MID_PRUNING_LAYER_IDX, wipe_layer_idx)
+        mid_scoring_layer_idx = min(mid_pruning_layer_idx, max(len(layers) - 1, 0))
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
@@ -552,7 +696,7 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             position_ids=position_ids,
             cache_position=pre_cache_position,
         )
-        for layer_idx in range(wipe_layer_idx):
+        for layer_idx in range(mid_pruning_layer_idx):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             hidden_states, attn, present = self._run_layer(
@@ -571,25 +715,87 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
             if output_attentions:
                 all_attns = all_attns + (attn,)
 
+        mid_visual_positions = scoped_input_ids[0].eq(IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+        mid_query_indices = self._build_mid_query_indices(
+            input_ids=scoped_input_ids,
+            attention_mask=attention_mask,
+            visual_positions=mid_visual_positions,
+            attn_anchor=str(attn_anchor).strip().lower(),
+        )
+        if mid_visual_positions.numel() > 0:
+            mid_importance_scores = self._get_visual_token_attention_scores(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                scoring_layer_idx=mid_scoring_layer_idx,
+                visual_positions=mid_visual_positions,
+                query_indices=mid_query_indices,
+            ).mean(dim=0)
+        else:
+            mid_importance_scores = hidden_states.new_zeros((0,))
+        mid_target_count_value = _mid_target_count(mid_target_count)
+        hidden_states, mid_input_ids, mid_attention_mask, mid_position_ids, mid_scoped_keep_positions = self._prune_by_mid_attention_scores(
+            hidden_states=hidden_states,
+            input_ids=scoped_input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            importance_scores=mid_importance_scores,
+            target_count=mid_target_count_value,
+        )
+        mid_keep_positions_in_original = scoped_keep_positions.index_select(1, mid_scoped_keep_positions[0])
+        mid_pruned_visual_tokens = int(attention_mask.shape[1] - mid_attention_mask.shape[1])
+        mid_cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
+        mid_mask = self._prepare_mask(
+            mid_attention_mask,
+            hidden_states,
+            position_ids=mid_position_ids,
+            cache_position=mid_cache_position,
+        )
+        for layer_idx in range(mid_pruning_layer_idx, wipe_layer_idx):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+            hidden_states, attn, present = self._run_layer(
+                layers[layer_idx],
+                hidden_states,
+                mid_mask,
+                mid_position_ids,
+                past_key_value=next_cache,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                cache_position=mid_cache_position,
+            )
+            if use_cache:
+                if isinstance(next_cache, list):
+                    next_cache.append(present)
+            if output_attentions:
+                all_attns = all_attns + (attn,)
+
         if enable_finalwipe:
             hidden_states, final_input_ids, final_attention_mask, final_position_ids, wiped_keep_positions = self._wipe_visual_tokens(
                 hidden_states=hidden_states,
-                input_ids=scoped_input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+                input_ids=mid_input_ids,
+                attention_mask=mid_attention_mask,
+                position_ids=mid_position_ids,
             )
-            final_keep_positions = scoped_keep_positions.index_select(1, wiped_keep_positions[0])
-            final_wiped_visual_tokens = int(attention_mask.shape[1] - final_attention_mask.shape[1])
+            final_keep_positions = mid_keep_positions_in_original.index_select(1, wiped_keep_positions[0])
+            final_wiped_visual_tokens = int(mid_attention_mask.shape[1] - final_attention_mask.shape[1])
         else:
-            final_input_ids = scoped_input_ids
-            final_attention_mask = attention_mask
-            final_position_ids = position_ids
-            final_keep_positions = scoped_keep_positions
+            final_input_ids = mid_input_ids
+            final_attention_mask = mid_attention_mask
+            final_position_ids = mid_position_ids
+            final_keep_positions = mid_keep_positions_in_original
             final_wiped_visual_tokens = 0
         if getattr(self, "learnable_prune_stats", None):
             self.learnable_prune_stats[-1].update(
                 {
                     "enable_finalwipe": bool(enable_finalwipe),
+                    "mid_pruning_layer_idx": int(mid_pruning_layer_idx),
+                    "mid_scoring_layer_idx": int(mid_scoring_layer_idx),
+                    "mid_attn_anchor": str(attn_anchor).strip().lower(),
+                    "mid_query_count": int(mid_query_indices.numel()),
+                    "mid_target_visual_tokens": int(min(max(int(mid_target_count_value), 0), int(mid_visual_positions.numel()))),
+                    "mid_pruned_visual_tokens": int(mid_pruned_visual_tokens),
+                    "mid_sequence_tokens": int(mid_attention_mask.shape[1]),
                     "final_wipe_layer_idx": int(wipe_layer_idx),
                     "final_wiped_visual_tokens": int(final_wiped_visual_tokens),
                     "final_sequence_tokens": int(final_attention_mask.shape[1]),
@@ -659,6 +865,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         learnable_prune_input_ids: Optional[torch.LongTensor] = None,
         learnable_prune: bool = True,
+        attn_anchor: str = MID_ATTN_ANCHOR,
+        mid_target_count: Optional[int] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if labels is not None or images is not None:
@@ -719,6 +927,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
                 use_cache=bool(use_cache),
                 output_attentions=bool(output_attentions),
                 output_hidden_states=bool(output_hidden_states),
+                attn_anchor=attn_anchor,
+                mid_target_count=mid_target_count,
             )
         elif getattr(self, "_scope_finalwipe_applied", False) and past_key_values is not None:
             current_seq_len = inputs_embeds.shape[1]
@@ -824,6 +1034,8 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         past_key_values=None,
         inputs_embeds=None,
         learnable_prune_input_ids=None,
+        attn_anchor=None,
+        mid_target_count=None,
         **kwargs,
     ):
         model_inputs = super().prepare_inputs_for_generation(
@@ -834,6 +1046,10 @@ class LlavaLearnablePruneScopeFinalwipeForCausalLM(LlavaLlamaForCausalLM):
         )
         if self._is_initial_prefill_cache(past_key_values) and learnable_prune_input_ids is not None:
             model_inputs["learnable_prune_input_ids"] = learnable_prune_input_ids
+            if attn_anchor is not None:
+                model_inputs["attn_anchor"] = attn_anchor
+            if mid_target_count is not None:
+                model_inputs["mid_target_count"] = mid_target_count
         return model_inputs
 
     @torch.no_grad()
