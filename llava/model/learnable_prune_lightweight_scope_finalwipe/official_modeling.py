@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -24,13 +25,13 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM, LlavaLlamaModel
 
 
-DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_lightweight_top64_layer20_sample0.2"
+DEFAULT_CHECKPOINT = "/data1/chenzixuan/train_output/official_llava_learnable_prune_lightweight_top64_layer18_sample0.2"
 LEARNABLE_TOPK = 64
-SCOPE_TARGET_COUNT = 107
-MID_PRUNING_LAYER_IDX = 20
-MID_TARGET_COUNT = 64
+SCOPE_TARGET_COUNT = 137
+MID_PRUNING_LAYER_IDX = 12
+MID_TARGET_COUNT = 32
 MID_ATTN_ANCHOR = "query"
-FINAL_WIPE_LAYER_IDX = 24
+FINAL_WIPE_LAYER_IDX = 25
 ENABLE_FINALWIPE = True
 ENABLE_PREDICTOR = True
 
@@ -49,6 +50,14 @@ def _env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _env_int_list(name: str, default: List[int]) -> List[int]:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return [int(x) for x in default]
+    parsed = [int(x) for x in re.findall(r"-?\d+", value)]
+    return parsed or [int(x) for x in default]
+
+
 def _enable_finalwipe() -> bool:
     return _env_flag("ENABLE_FINALWIPE", ENABLE_FINALWIPE)
 
@@ -60,6 +69,27 @@ def _enable_predictor() -> bool:
 def _mid_target_count(default: Optional[int] = None) -> int:
     base = MID_TARGET_COUNT if default is None else int(default)
     return _env_int("MID_TARGET_COUNT", base)
+
+
+def _learnable_topk(default: Optional[int] = None) -> int:
+    base = LEARNABLE_TOPK if default is None else int(default)
+    return _env_int("LEARNABLE_TOPK", base)
+
+
+def _scope_target_count() -> int:
+    return _env_int("SCOPE_TARGET_COUNT", SCOPE_TARGET_COUNT)
+
+
+def _mid_pruning_layer_idx() -> int:
+    return _env_int("MID_PRUNING_LAYER_IDX", MID_PRUNING_LAYER_IDX)
+
+
+def _final_wipe_layer_idx() -> int:
+    return _env_int("FINAL_WIPE_LAYER_IDX", FINAL_WIPE_LAYER_IDX)
+
+
+def _final_wipe_layer_idxs() -> List[int]:
+    return _env_int_list("FINAL_WIPE_LAYER_IDX", [FINAL_WIPE_LAYER_IDX])
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -192,7 +222,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             param.requires_grad = False
         self.learnable_prune_predictor = predictor
         self.learnable_prune_config = dict(config)
-        self.learnable_prune_keep_k = int(config.get("keep_k", LEARNABLE_TOPK))
+        self.learnable_prune_keep_k = _learnable_topk(int(config.get("keep_k", LEARNABLE_TOPK)))
         self.learnable_prune_checkpoint = str(checkpoint)
         self.learnable_prune_stats: List[Dict[str, Any]] = []
 
@@ -363,7 +393,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             topk = 0
             top_relative = torch.empty((0,), dtype=torch.long, device=visual_positions.device)
 
-        target_keep = min(SCOPE_TARGET_COUNT, int(visual_positions.numel()))
+        target_keep = min(_scope_target_count(), int(visual_positions.numel()))
         if target_keep > topk:
             visual_embeds = inputs_embeds.index_select(1, visual_positions)
             seeded_scope_rank, _ = SeededResidualSCOPE(
@@ -699,8 +729,9 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         )
         layers = self.model.layers
         enable_finalwipe = _enable_finalwipe()
-        wipe_layer_idx = min(FINAL_WIPE_LAYER_IDX, len(layers)) if enable_finalwipe else len(layers)
-        mid_pruning_layer_idx = min(MID_PRUNING_LAYER_IDX, wipe_layer_idx)
+        final_wipe_layer_idxs = _final_wipe_layer_idxs()
+        wipe_layer_idx = min(min(final_wipe_layer_idxs), len(layers)) if enable_finalwipe else len(layers)
+        mid_pruning_layer_idx = min(_mid_pruning_layer_idx(), wipe_layer_idx)
         mid_scoring_layer_idx = min(mid_pruning_layer_idx, max(len(layers) - 1, 0))
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
@@ -806,6 +837,13 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             final_keep_positions = mid_keep_positions_in_original
             final_wiped_visual_tokens = 0
         if getattr(self, "learnable_prune_stats", None):
+            stats = self.learnable_prune_stats[-1]
+            scope_visual_tokens = int(stats.get("scope_target_visual_tokens", 0))
+            mid_visual_tokens = int(min(max(int(mid_target_count_value), 0), int(mid_visual_positions.numel())))
+            avg_visual_tokens_budget = (
+                mid_pruning_layer_idx * scope_visual_tokens
+                + (wipe_layer_idx - mid_pruning_layer_idx) * mid_visual_tokens
+            ) / max(len(layers), 1)
             self.learnable_prune_stats[-1].update(
                 {
                     "enable_finalwipe": bool(enable_finalwipe),
@@ -813,10 +851,12 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                     "mid_scoring_layer_idx": int(mid_scoring_layer_idx),
                     "mid_attn_anchor": str(attn_anchor).strip().lower(),
                     "mid_query_count": int(mid_query_indices.numel()),
-                    "mid_target_visual_tokens": int(min(max(int(mid_target_count_value), 0), int(mid_visual_positions.numel()))),
+                    "mid_target_visual_tokens": int(mid_visual_tokens),
+                    "avg_visual_tokens_budget": float(avg_visual_tokens_budget),
                     "mid_pruned_visual_tokens": int(mid_pruned_visual_tokens),
                     "mid_sequence_tokens": int(mid_attention_mask.shape[1]),
                     "final_wipe_layer_idx": int(wipe_layer_idx),
+                    "final_wipe_layer_idxs": [int(x) for x in final_wipe_layer_idxs],
                     "final_wiped_visual_tokens": int(final_wiped_visual_tokens),
                     "final_sequence_tokens": int(final_attention_mask.shape[1]),
                 }
