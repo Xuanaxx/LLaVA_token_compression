@@ -7,7 +7,7 @@ fi
 source /data1/chenzixuan/uv_env/.tokencompression/bin/activate
 cd /data1/chenzixuan/open_source_projects/LLaVA_token_compression/learnable_pruner_lightweight
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,7}
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-"expandable_segments:True"}
 export WANDB_PROJECT=${WANDB_PROJECT:-"llava_learnable_prune_lightweight_fixed_layer"}
@@ -39,10 +39,10 @@ ENABLE_RSS=${ENABLE_RSS:-false}
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/data1/chenzixuan/model/liuhaotian/llava-v1.5-13b"}
 DATA_DIR=${DATA_DIR:-"/data2/czx/data/llava_1_5_mix665k_full"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
-RUN_NAME=${RUN_NAME:-"official_llava_13b_learnable_prune_lightweight_top64_layer18_sample0.2"}
+RUN_NAME=${RUN_NAME:-"official_llava_13b_learnable_prune_lightweight_top64_layer8_sample0.2"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-"$OUTPUT_ROOT/$RUN_NAME/teacher_target_logs"}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}
-TEACHER_LAYER=${TEACHER_LAYER:-18}
+TEACHER_LAYER=${TEACHER_LAYER:-8}
 
 # TCLM-RankSwiGLU predictor config.
 PREDICTOR_HIDDEN_SIZE=${PREDICTOR_HIDDEN_SIZE:-384}

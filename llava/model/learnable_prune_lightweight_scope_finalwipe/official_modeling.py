@@ -464,8 +464,12 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if visual_positions.numel() == 0 or query_indices.numel() == 0:
             return hidden_states.new_zeros((0, visual_positions.numel()))
 
-        attention_mask = attention_mask.to(device=hidden_states.device)
-        position_ids = position_ids.to(device=hidden_states.device)
+        layer_device = next(scoring_layer.parameters()).device
+        hidden_states = hidden_states.to(device=layer_device)
+        attention_mask = attention_mask.to(device=layer_device)
+        position_ids = position_ids.to(device=layer_device)
+        visual_positions = visual_positions.to(dtype=torch.long, device=layer_device)
+        query_indices = query_indices.to(dtype=torch.long, device=layer_device)
         hidden_normed = scoring_layer.input_layernorm(hidden_states)
         num_heads = getattr(self_attn.config, "num_attention_heads", None)
         if num_heads is None:
@@ -479,13 +483,19 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         key_states = self_attn.k_proj(hidden_normed).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
         value_states = self_attn.v_proj(hidden_normed).view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
         cos, sin = self.model.rotary_emb(hidden_states, position_ids)
+        scoring_device = query_states.device
+        key_states = key_states.to(device=scoring_device)
+        value_states = value_states.to(device=scoring_device)
+        cos = cos.to(device=scoring_device)
+        sin = sin.to(device=scoring_device)
+        attention_mask = attention_mask.to(device=scoring_device)
+        visual_positions = visual_positions.to(device=scoring_device)
+        q_idx = query_indices.to(device=scoring_device)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
         value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
 
-        q_idx = query_indices.to(dtype=torch.long, device=hidden_states.device)
-        visual_positions = visual_positions.to(dtype=torch.long, device=hidden_states.device)
-        key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+        key_positions = torch.arange(seq_len, device=scoring_device).view(1, 1, 1, seq_len)
         key_valid = attention_mask[:, None, None, :].bool()
         v_visual = value_states.index_select(2, visual_positions)[0]
         query_chunk_size = 8
