@@ -28,6 +28,7 @@ import copy
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -60,7 +61,8 @@ except ImportError:
 
 from llava import conversation as conversation_lib  # noqa: E402
 from llava.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX  # noqa: E402
-from llava.mm_utils import tokenizer_image_token  # noqa: E402
+from llava.mm_utils import get_anyres_image_grid_shape, process_anyres_image, tokenizer_image_token  # noqa: E402
+from llava.model.llava_arch import unpad_image  # noqa: E402
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM  # noqa: E402
 
 
@@ -116,11 +118,19 @@ class IndexedDataset(Dataset):
 
 
 class SimpleDataArguments:
-    def __init__(self, data_path: str, image_folder: str, image_processor, image_aspect_ratio: str = "pad"):
+    def __init__(
+        self,
+        data_path: str,
+        image_folder: str,
+        image_processor,
+        image_aspect_ratio: str = "pad",
+        image_grid_pinpoints=None,
+    ):
         self.data_path = data_path
         self.image_folder = image_folder
         self.image_processor = image_processor
         self.image_aspect_ratio = image_aspect_ratio
+        self.image_grid_pinpoints = image_grid_pinpoints
         self.is_multimodal = True
         self.mm_use_im_start_end = False
 
@@ -304,9 +314,16 @@ class LazySupervisedDataset(Dataset):
                 w = crop_size["width"] if isinstance(crop_size, dict) else crop_size
                 image = Image.new("RGB", (w, h), (0, 0, 0))
             processor = self.data_args.image_processor
+            image_size = tuple(int(x) for x in image.size)
             if self.data_args.image_aspect_ratio == "pad":
                 image = _expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
-            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+                image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+            elif self.data_args.image_aspect_ratio == "anyres":
+                if self.data_args.image_grid_pinpoints is None:
+                    raise ValueError("image_grid_pinpoints is required when --image_aspect_ratio anyres.")
+                image = process_anyres_image(image, processor, self.data_args.image_grid_pinpoints)
+            else:
+                image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
             text_sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
         else:
             text_sources = copy.deepcopy([e["conversations"] for e in sources])
@@ -314,11 +331,13 @@ class LazySupervisedDataset(Dataset):
             h = crop_size["height"] if isinstance(crop_size, dict) else crop_size
             w = crop_size["width"] if isinstance(crop_size, dict) else crop_size
             image = torch.zeros(3, h, w)
+            image_size = (int(w), int(h))
 
         data_dict = preprocess(text_sources, self.tokenizer, has_image=("image" in self.list_data_dict[i]))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
         data_dict["image"] = image
+        data_dict["image_size"] = image_size
         return data_dict
 
 
@@ -347,6 +366,8 @@ class DataCollatorForSupervisedDataset:
             batch["images"] = torch.stack(images)
         else:
             batch["images"] = images
+        if all("image_size" in instance for instance in instances):
+            batch["image_sizes"] = [tuple(int(x) for x in instance["image_size"]) for instance in instances]
         batch["sample_ids"] = torch.tensor(sample_ids, dtype=torch.long)
         return batch
 
@@ -404,6 +425,19 @@ def _make_4d_causal_mask(
     if key_log_bias is not None:
         mask = mask + key_log_bias.to(device=device, dtype=dtype)[:, None, None, :]
     return mask.masked_fill(~allowed, min_dtype)
+
+
+def _image_size_tuple(image_sizes: Any, image_idx: int) -> Tuple[int, int]:
+    if image_sizes is None:
+        raise ValueError("image_sizes is required for LLaVA-NeXT anyres spatial merging.")
+    image_size = image_sizes[image_idx]
+    if torch.is_tensor(image_size):
+        image_size = image_size.detach().cpu().tolist()
+    elif isinstance(image_size, np.ndarray):
+        image_size = image_size.tolist()
+    if len(image_size) != 2:
+        raise ValueError(f"Expected image_sizes[{image_idx}] to contain (width, height), got: {image_size}")
+    return int(image_size[0]), int(image_size[1])
 
 
 class _BudgetedSigmoidTopK(torch.autograd.Function):
@@ -679,6 +713,85 @@ class LearnablePruneWrapper(nn.Module):
             raise RuntimeError(f"Failed to capture teacher hidden states for layer: {teacher_layer}")
         return full_outputs, teacher_states, teacher_layer
 
+    def _encode_and_merge_image_features(self, images: Any, image_sizes: Optional[Any] = None) -> List[torch.Tensor]:
+        """Match LlavaMetaForCausalLM.prepare_inputs_labels_for_multimodal image merging."""
+
+        if isinstance(images, (list, tuple)) or (torch.is_tensor(images) and images.ndim == 5):
+            if isinstance(images, (list, tuple)):
+                image_batches = [image.unsqueeze(0) if image.ndim == 3 else image for image in images]
+            else:
+                image_batches = [image for image in images]
+
+            concat_images = torch.cat([image for image in image_batches], dim=0)
+            image_features = self.llava.encode_images(concat_images)
+            split_sizes = [image.shape[0] for image in image_batches]
+            image_features = torch.split(image_features, split_sizes, dim=0)
+
+            mm_patch_merge_type = getattr(self.llava.config, "mm_patch_merge_type", "flat")
+            image_aspect_ratio = getattr(self.llava.config, "image_aspect_ratio", "square")
+            if mm_patch_merge_type == "flat":
+                return [feature.flatten(0, 1) for feature in image_features]
+            if not mm_patch_merge_type.startswith("spatial"):
+                raise ValueError(f"Unexpected mm_patch_merge_type: {mm_patch_merge_type}")
+
+            merged_features: List[torch.Tensor] = []
+            vision_tower = self.llava.get_vision_tower()
+            for image_idx, image_feature in enumerate(image_features):
+                if image_feature.shape[0] > 1:
+                    base_image_feature = image_feature[0]
+                    patch_image_feature = image_feature[1:]
+                    height = width = vision_tower.num_patches_per_side
+                    if height * width != base_image_feature.shape[0]:
+                        raise ValueError(
+                            f"Unexpected base image feature length {base_image_feature.shape[0]} for {height}x{width} patches."
+                        )
+                    if image_aspect_ratio != "anyres":
+                        raise NotImplementedError(
+                            f"Spatial patch merging currently expects image_aspect_ratio='anyres', got {image_aspect_ratio!r}."
+                        )
+                    image_size = _image_size_tuple(image_sizes, image_idx)
+                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(
+                        image_size,
+                        self.llava.config.image_grid_pinpoints,
+                        vision_tower.config.image_size,
+                    )
+                    patch_image_feature = patch_image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                    if "unpad" in mm_patch_merge_type:
+                        patch_image_feature = patch_image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                        patch_image_feature = patch_image_feature.flatten(1, 2).flatten(2, 3)
+                        patch_image_feature = unpad_image(patch_image_feature, image_size)
+                        image_newline = self.llava.model.image_newline.to(
+                            device=patch_image_feature.device,
+                            dtype=patch_image_feature.dtype,
+                        )
+                        patch_image_feature = torch.cat(
+                            (
+                                patch_image_feature,
+                                image_newline[:, None, None].expand(*patch_image_feature.shape[:-1], 1),
+                            ),
+                            dim=-1,
+                        )
+                        patch_image_feature = patch_image_feature.flatten(1, 2).transpose(0, 1)
+                    else:
+                        patch_image_feature = patch_image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                        patch_image_feature = patch_image_feature.flatten(0, 3)
+                    image_feature = torch.cat((base_image_feature, patch_image_feature), dim=0)
+                else:
+                    image_feature = image_feature[0]
+                    if "unpad" in mm_patch_merge_type:
+                        image_newline = self.llava.model.image_newline.to(
+                            device=image_feature.device,
+                            dtype=image_feature.dtype,
+                        )
+                        image_feature = torch.cat((image_feature, image_newline[None]), dim=0)
+                merged_features.append(image_feature)
+            return merged_features
+
+        image_features = self.llava.encode_images(images)
+        if torch.is_tensor(image_features):
+            return [feature for feature in image_features]
+        return list(image_features)
+
     def _build_multimodal_inputs(
         self,
         input_ids: torch.Tensor,
@@ -686,6 +799,7 @@ class LearnablePruneWrapper(nn.Module):
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        image_sizes: Optional[Any] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Expand official LLaVA IMAGE_TOKEN_INDEX placeholders to image embeddings.
 
@@ -704,11 +818,7 @@ class LearnablePruneWrapper(nn.Module):
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        image_features = self.llava.encode_images(images)
-        if torch.is_tensor(image_features):
-            image_features = [feat for feat in image_features]
-        else:
-            image_features = list(image_features)
+        image_features = self._encode_and_merge_image_features(images, image_sizes=image_sizes)
 
         compact_input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         compact_labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
@@ -1215,6 +1325,7 @@ class LearnablePruneWrapper(nn.Module):
         labels: torch.Tensor,
         images: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
+        image_sizes: Optional[Any] = None,
         position_ids: Optional[torch.Tensor] = None,
         sample_ids: Optional[torch.Tensor] = None,
         **_: Any,
@@ -1234,6 +1345,7 @@ class LearnablePruneWrapper(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             position_ids=position_ids,
+            image_sizes=image_sizes,
         )
 
         with torch.no_grad():
@@ -1699,6 +1811,7 @@ def main() -> None:
         image_folder=image_folder,
         image_processor=vision_tower.image_processor,
         image_aspect_ratio=args.image_aspect_ratio,
+        image_grid_pinpoints=getattr(llava.config, "image_grid_pinpoints", None),
     )
     dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
     if args.max_samples is not None:

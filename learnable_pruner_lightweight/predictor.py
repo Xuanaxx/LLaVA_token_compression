@@ -28,6 +28,9 @@ from torch import nn
 from torch.nn import functional as F
 
 
+_POSITION_EMBEDDING_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -49,6 +52,12 @@ def _sinusoidal_position_embedding(
     if seq_len <= 0:
         return torch.empty((1, 0, dim), device=device, dtype=dtype)
 
+    cache_key = ("1d", int(seq_len), int(dim), device.type, device.index, dtype)
+    if not torch.is_grad_enabled():
+        cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     # Build in fp32 for numerical stability, then cast back.
     position = torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(1)
     half_dim = (dim + 1) // 2
@@ -59,7 +68,10 @@ def _sinusoidal_position_embedding(
     pe = torch.zeros((seq_len, dim), device=device, dtype=torch.float32)
     pe[:, 0::2] = torch.sin(position * div_term[: pe[:, 0::2].shape[1]])
     pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
-    return pe.unsqueeze(0).to(dtype=dtype)
+    pe = pe.unsqueeze(0).to(dtype=dtype)
+    if not torch.is_grad_enabled():
+        _POSITION_EMBEDDING_CACHE[cache_key] = pe
+    return pe
 
 
 def _sinusoidal_2d_position_embedding(
@@ -73,6 +85,11 @@ def _sinusoidal_2d_position_embedding(
     side = int(seq_len**0.5)
     if seq_len <= 0:
         return torch.empty((1, 0, dim), device=device, dtype=dtype)
+    cache_key = ("2d", int(seq_len), int(dim), device.type, device.index, dtype)
+    if not torch.is_grad_enabled():
+        cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
     if side * side != seq_len:
         return _sinusoidal_position_embedding(seq_len, dim, device=device, dtype=dtype)
 
@@ -82,7 +99,10 @@ def _sinusoidal_2d_position_embedding(
     col_pe = _sinusoidal_position_embedding(side, col_dim, device=device, dtype=dtype)
     rows = row_pe[:, :, None, :].expand(1, side, side, row_dim)
     cols = col_pe[:, None, :, :].expand(1, side, side, col_dim)
-    return torch.cat([rows, cols], dim=-1).reshape(1, seq_len, dim)
+    pe = torch.cat([rows, cols], dim=-1).reshape(1, seq_len, dim)
+    if not torch.is_grad_enabled():
+        _POSITION_EMBEDDING_CACHE[cache_key] = pe
+    return pe
 
 
 class RankSwiGLU(nn.Module):
