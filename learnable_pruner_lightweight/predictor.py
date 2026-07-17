@@ -7,9 +7,9 @@ TopK seed prediction.
 
 Design:
     1. Shared down projection from LVLM hidden size to predictor width.
-    2. Parameter-free sinusoidal position encodings: 2D for visual grids,
-       1D for prompt text tokens.
-    3. One low-rank visual-to-text token alignment.
+    2. Parameter-free sinusoidal position encodings: true normalized 2D
+       coordinates for visual tokens and 1D positions for prompt text tokens.
+    3. One multi-head low-rank visual-to-text token alignment.
     4. Low-rank multiplicative visual-text matching.
     5. A tiny SwiGLU FFN in rank space, followed by one scalar score head.
 
@@ -53,10 +53,9 @@ def _sinusoidal_position_embedding(
         return torch.empty((1, 0, dim), device=device, dtype=dtype)
 
     cache_key = ("1d", int(seq_len), int(dim), device.type, device.index, dtype)
-    if not torch.is_grad_enabled():
-        cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     # Build in fp32 for numerical stability, then cast back.
     position = torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(1)
@@ -69,8 +68,9 @@ def _sinusoidal_position_embedding(
     pe[:, 0::2] = torch.sin(position * div_term[: pe[:, 0::2].shape[1]])
     pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
     pe = pe.unsqueeze(0).to(dtype=dtype)
-    if not torch.is_grad_enabled():
-        _POSITION_EMBEDDING_CACHE[cache_key] = pe
+    # The encoding is parameter-free and never participates in autograd, so it
+    # is safe (and substantially cheaper) to cache it during training as well.
+    _POSITION_EMBEDDING_CACHE[cache_key] = pe
     return pe
 
 
@@ -86,10 +86,9 @@ def _sinusoidal_2d_position_embedding(
     if seq_len <= 0:
         return torch.empty((1, 0, dim), device=device, dtype=dtype)
     cache_key = ("2d", int(seq_len), int(dim), device.type, device.index, dtype)
-    if not torch.is_grad_enabled():
-        cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    cached = _POSITION_EMBEDDING_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     if side * side != seq_len:
         return _sinusoidal_position_embedding(seq_len, dim, device=device, dtype=dtype)
 
@@ -100,9 +99,17 @@ def _sinusoidal_2d_position_embedding(
     rows = row_pe[:, :, None, :].expand(1, side, side, row_dim)
     cols = col_pe[:, None, :, :].expand(1, side, side, col_dim)
     pe = torch.cat([rows, cols], dim=-1).reshape(1, seq_len, dim)
-    if not torch.is_grad_enabled():
-        _POSITION_EMBEDDING_CACHE[cache_key] = pe
+    _POSITION_EMBEDDING_CACHE[cache_key] = pe
     return pe
+
+
+def _coordinate_2d_features(coordinates: torch.Tensor) -> torch.Tensor:
+    """Cheap polynomial basis for normalized ``[..., x, y]`` coordinates."""
+    if coordinates.shape[-1] != 2:
+        raise ValueError(f"visual_coordinates must end in size 2, got {tuple(coordinates.shape)}")
+    x, y = coordinates.unbind(dim=-1)
+    x2, y2 = x.square(), y.square()
+    return torch.stack((x, y, x2, y2, x * y, x2 * y, x * y2, torch.ones_like(x)), dim=-1)
 
 
 class RankSwiGLU(nn.Module):
@@ -126,9 +133,11 @@ class LearnablePrunePredictor(nn.Module):
         input_size: LVLM hidden size of input embeddings, e.g. 4096 for LLaVA-7B.
         hidden_size: Predictor width after down projection.
         rank: Low-rank interaction width for alignment and matching.
+        num_heads: Number of fused cross-attention heads. ``rank`` is the
+            total interaction width across all heads.
         rank_mlp_ratio: Expansion ratio of the Rank-SwiGLU FFN.
-        use_visual_position: Add fixed sinusoidal 2D position encoding to visual
-            tokens when they form a square grid; otherwise use 1D.
+        use_visual_position: Encode supplied true anyres coordinates; retain a
+            legacy sequence-derived fallback when coordinates are unavailable.
         use_text_position: Add fixed sinusoidal 1D position encoding to text tokens.
 
     """
@@ -136,8 +145,9 @@ class LearnablePrunePredictor(nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 384,
-        rank: int = 128,
+        hidden_size: int = 512,
+        rank: int = 256,
+        num_heads: int = 4,
         rank_mlp_ratio: int = 2,
         use_visual_position: bool = True,
         use_text_position: bool = True,
@@ -146,6 +156,7 @@ class LearnablePrunePredictor(nn.Module):
         self.input_size = int(input_size)
         self.hidden_size = int(hidden_size)
         self.rank = int(rank)
+        self.num_heads = int(num_heads)
         self.rank_mlp_ratio = int(rank_mlp_ratio)
         self.use_visual_position = bool(use_visual_position)
         self.use_text_position = bool(use_text_position)
@@ -154,24 +165,33 @@ class LearnablePrunePredictor(nn.Module):
             raise ValueError("hidden_size must be positive")
         if self.rank <= 0:
             raise ValueError("rank must be positive")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if self.rank % self.num_heads != 0:
+            raise ValueError("rank must be divisible by num_heads")
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
         if self.rank_mlp_ratio <= 0:
             raise ValueError("rank_mlp_ratio must be positive")
 
         self.in_proj = nn.Linear(self.input_size, self.hidden_size, bias=False)
+        self.visual_position_proj = nn.Linear(8, self.hidden_size, bias=False)
 
         # Normalization for each stream / interaction space.
         self.v_norm = RMSNorm(self.hidden_size)
         self.t_norm = RMSNorm(self.hidden_size)
-        self.c_norm = RMSNorm(self.hidden_size)
+        self.c_norm = RMSNorm(self.rank)
         self.m_norm = RMSNorm(self.rank)
 
-        # One low-rank visual-to-text alignment.
+        # Multi-head low-rank visual-to-text alignment. Q/K/V share the total
+        # interaction width so fused SDPA can avoid an explicit attention map.
         self.q_proj = nn.Linear(self.hidden_size, self.rank, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.rank, bias=False)
+        self.text_value_proj = nn.Linear(self.hidden_size, self.rank, bias=False)
 
         # Low-rank multiplicative matching.
         self.v_match = nn.Linear(self.hidden_size, self.rank, bias=False)
-        self.c_match = nn.Linear(self.hidden_size, self.rank, bias=False)
+        self.c_match = nn.Linear(self.rank, self.rank, bias=False)
 
         # Nonlinear TopK decision boundary in matching space.
         self.rank_ffn = RankSwiGLU(self.rank, mlp_ratio=self.rank_mlp_ratio)
@@ -181,7 +201,8 @@ class LearnablePrunePredictor(nn.Module):
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.in_proj.weight, mean=0.0, std=0.02)
-        for module in (self.q_proj, self.k_proj, self.v_match, self.c_match):
+        nn.init.normal_(self.visual_position_proj.weight, mean=0.0, std=0.02)
+        for module in (self.q_proj, self.k_proj, self.text_value_proj, self.v_match, self.c_match):
             nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(module.in_features))
         for module in (self.rank_ffn.gate_proj, self.rank_ffn.up_proj, self.rank_ffn.down_proj):
             nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(module.in_features))
@@ -192,20 +213,30 @@ class LearnablePrunePredictor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         token_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pack variable-length masked tokens into dense [B, max_tokens, D]."""
+        auxiliary_states: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Pack tokens and optional small side features with one index pass."""
         bsz, _, hidden_size = hidden_states.shape
         token_mask = token_mask.bool()
         token_lengths = token_mask.long().sum(dim=1)
         max_tokens = int(token_lengths.max().item()) if token_lengths.numel() > 0 else 0
         token_states = hidden_states.new_zeros((bsz, max_tokens, hidden_size))
+        packed_auxiliary = None
+        if auxiliary_states is not None:
+            if auxiliary_states.shape[:2] != hidden_states.shape[:2]:
+                raise ValueError("auxiliary_states must share [B, S] with hidden_states")
+            packed_auxiliary = auxiliary_states.new_zeros(
+                (bsz, max_tokens, *auxiliary_states.shape[2:])
+            )
         valid_mask = torch.zeros((bsz, max_tokens), device=hidden_states.device, dtype=torch.bool)
         if max_tokens > 0:
             batch_idx, seq_idx = token_mask.nonzero(as_tuple=True)
             slot_idx = token_mask.long().cumsum(dim=1)[batch_idx, seq_idx] - 1
             token_states[batch_idx, slot_idx] = hidden_states[batch_idx, seq_idx]
+            if packed_auxiliary is not None:
+                packed_auxiliary[batch_idx, slot_idx] = auxiliary_states[batch_idx, seq_idx]
             valid_mask[batch_idx, slot_idx] = True
-        return token_states, valid_mask
+        return token_states, valid_mask, packed_auxiliary
 
     def _maybe_add_text_position(self, text: torch.Tensor, text_valid: torch.Tensor) -> torch.Tensor:
         if not self.use_text_position or text.shape[1] <= 0:
@@ -220,15 +251,29 @@ class LearnablePrunePredictor(nn.Module):
         # Keep padded slots exactly zero; this makes empty-row dummy tokens safe.
         return text * text_valid.to(dtype=text.dtype).unsqueeze(-1)
 
-    def _maybe_add_visual_position(self, visual: torch.Tensor, visual_valid: torch.Tensor) -> torch.Tensor:
+    def _maybe_add_visual_position(
+        self,
+        visual: torch.Tensor,
+        visual_valid: torch.Tensor,
+        visual_coordinates: torch.Tensor | None,
+    ) -> torch.Tensor:
         if not self.use_visual_position or visual.shape[1] <= 0:
             return visual
-        pe = _sinusoidal_2d_position_embedding(
-            visual.shape[1],
-            visual.shape[-1],
-            device=visual.device,
-            dtype=visual.dtype,
-        )
+        if visual_coordinates is None:
+            pe = _sinusoidal_2d_position_embedding(
+                visual.shape[1], visual.shape[-1], device=visual.device, dtype=visual.dtype
+            )
+        else:
+            if visual_coordinates.shape != (*visual.shape[:2], 2):
+                raise ValueError(
+                    "visual_coordinates must have shape [B, Nv, 2], got "
+                    f"{tuple(visual_coordinates.shape)} for visual shape {tuple(visual.shape)}"
+                )
+            pe = self.visual_position_proj(
+                _coordinate_2d_features(
+                    visual_coordinates.to(device=visual.device, dtype=visual.dtype)
+                )
+            )
         visual = visual + pe
         return visual * visual_valid.to(dtype=visual.dtype).unsqueeze(-1)
 
@@ -238,6 +283,7 @@ class LearnablePrunePredictor(nn.Module):
         visual_valid: torch.Tensor,
         text: torch.Tensor,
         text_valid: torch.Tensor,
+        visual_coordinates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if visual.shape[1] == 0:
             return visual.new_zeros((visual.shape[0], 0))
@@ -248,29 +294,40 @@ class LearnablePrunePredictor(nn.Module):
             text = visual.new_zeros((visual.shape[0], 1, visual.shape[-1]))
             text_valid = torch.ones((visual.shape[0], 1), device=visual.device, dtype=torch.bool)
         else:
+            # Packed empty rows are already zero-filled. Mark their first slot as
+            # a dummy key without a host-synchronizing `any().item()` branch.
             empty_text = ~text_valid.any(dim=1)
-            if bool(empty_text.any().item()):
-                text = text.clone()
-                text_valid = text_valid.clone()
-                text[empty_text] = 0.0
-                text_valid[empty_text, 0] = True
+            text_valid[:, 0] |= empty_text
 
-        visual = self._maybe_add_visual_position(visual, visual_valid)
+        visual = self._maybe_add_visual_position(visual, visual_valid, visual_coordinates)
         text = self._maybe_add_text_position(text, text_valid)
 
-        q = self.q_proj(self.v_norm(visual))
-        k = self.k_proj(self.t_norm(text))
+        visual_norm = self.v_norm(visual)
+        q = self.q_proj(visual_norm)
+        text_norm = self.t_norm(text)
+        k = self.k_proj(text_norm)
+        value = self.text_value_proj(text_norm)
 
-        # Alignment softmax is computed in fp32 for stability, then context is
-        # accumulated in the predictor dtype.
-        attn_logits = (
-            torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(float(self.rank))
-        ).float()
-        attn_logits = attn_logits.masked_fill(~text_valid[:, None, :], torch.finfo(attn_logits.dtype).min)
-        alpha = torch.softmax(attn_logits, dim=-1).to(dtype=text.dtype)
-        ctx = torch.matmul(alpha, text)
+        # Keep Q/K/V in the autocast/predictor dtype so BF16/FP16 training can
+        # use tensor cores and the fused attention backend.
+        batch_size, visual_len, _ = q.shape
+        text_len = k.shape[1]
+        head_rank = self.rank // self.num_heads
+        q = q.view(batch_size, visual_len, self.num_heads, head_rank).transpose(1, 2)
+        k = k.view(batch_size, text_len, self.num_heads, head_rank).transpose(1, 2)
+        value = value.view(batch_size, text_len, self.num_heads, head_rank).transpose(1, 2)
+        # Fused SDPA avoids materializing a B x heads x Nv x Nt attention
+        # matrix. True mask entries are valid keys in PyTorch SDPA semantics.
+        ctx = F.scaled_dot_product_attention(
+            q,
+            k,
+            value,
+            attn_mask=text_valid[:, None, None, :],
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2).reshape(batch_size, visual_len, self.rank)
 
-        v_match = F.gelu(self.v_match(self.v_norm(visual)))
+        v_match = F.gelu(self.v_match(visual_norm))
         c_match = F.gelu(self.c_match(self.c_norm(ctx)))
         match = v_match * c_match
         match = match + self.rank_ffn(self.m_norm(match))
@@ -283,6 +340,7 @@ class LearnablePrunePredictor(nn.Module):
         visual_token_mask: torch.Tensor | None = None,
         text_token_mask: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        visual_coordinates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if attention_mask is None:
             attention_mask = multimodal_hidden_states.new_ones(multimodal_hidden_states.shape[:2], dtype=torch.bool)
@@ -297,16 +355,25 @@ class LearnablePrunePredictor(nn.Module):
         else:
             text_token_mask = text_token_mask.bool() & attention_mask & ~visual_token_mask
 
-        context = self.in_proj(multimodal_hidden_states)
-        visual, visual_valid = self._gather_token_states(context, visual_token_mask)
-        text, text_valid = self._gather_token_states(context, text_token_mask)
-        return self._score_visual_text(visual, visual_valid, text, text_valid)
+        # Pack first, then project. This avoids reading/projecting answer and
+        # padding tokens that the predictor never consumes.
+        if visual_coordinates is not None:
+            if visual_coordinates.shape[:2] != multimodal_hidden_states.shape[:2] or visual_coordinates.shape[-1] != 2:
+                raise ValueError("visual_coordinates must have shape [B, S, 2]")
+        visual, visual_valid, packed_coordinates = self._gather_token_states(
+            multimodal_hidden_states, visual_token_mask, visual_coordinates
+        )
+        text, text_valid, _ = self._gather_token_states(multimodal_hidden_states, text_token_mask)
+        visual = self.in_proj(visual)
+        text = self.in_proj(text)
+        return self._score_visual_text(visual, visual_valid, text, text_valid, packed_coordinates)
 
     def score_visual_text_by_positions(
         self,
         multimodal_hidden_states: torch.Tensor,
         visual_positions: torch.Tensor,
         text_positions: torch.Tensor,
+        visual_coordinates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Inference helper used by the LLaVA pruning wrapper.
 
@@ -317,16 +384,15 @@ class LearnablePrunePredictor(nn.Module):
         Returns:
             [B, Nv] logits.
         """
-        context = self.in_proj(multimodal_hidden_states)
-        visual_positions = visual_positions.to(device=context.device, dtype=torch.long)
-        text_positions = text_positions.to(device=context.device, dtype=torch.long)
+        visual_positions = visual_positions.to(device=multimodal_hidden_states.device, dtype=torch.long)
+        text_positions = text_positions.to(device=multimodal_hidden_states.device, dtype=torch.long)
 
-        visual = context.index_select(1, visual_positions)
-        visual_valid = torch.ones(visual.shape[:2], device=context.device, dtype=torch.bool)
+        visual = self.in_proj(multimodal_hidden_states.index_select(1, visual_positions))
+        visual_valid = torch.ones(visual.shape[:2], device=visual.device, dtype=torch.bool)
         if text_positions.numel() == 0:
-            text = context.new_zeros((context.shape[0], 1, context.shape[-1]))
-            text_valid = torch.ones(text.shape[:2], device=context.device, dtype=torch.bool)
+            text = visual.new_zeros((visual.shape[0], 1, visual.shape[-1]))
+            text_valid = torch.ones(text.shape[:2], device=visual.device, dtype=torch.bool)
         else:
-            text = context.index_select(1, text_positions)
-            text_valid = torch.ones(text.shape[:2], device=context.device, dtype=torch.bool)
-        return self._score_visual_text(visual, visual_valid, text, text_valid)
+            text = self.in_proj(multimodal_hidden_states.index_select(1, text_positions))
+            text_valid = torch.ones(text.shape[:2], device=visual.device, dtype=torch.bool)
+        return self._score_visual_text(visual, visual_valid, text, text_valid, visual_coordinates)

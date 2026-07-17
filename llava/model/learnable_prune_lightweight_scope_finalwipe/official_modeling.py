@@ -39,6 +39,7 @@ ENABLE_FINALWIPE = True
 ENABLE_PREDICTOR = True
 _SCOPE_GRAPH_CACHE: Dict[Tuple[Any, ...], Any] = {}
 _CAUSAL_BOOL_MASK_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
+_VISUAL_COORDINATE_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -114,6 +115,32 @@ def _image_size_tuple(image_sizes: Any, image_idx: int) -> Tuple[int, int]:
     if len(image_size) != 2:
         raise ValueError(f"Expected image_sizes[{image_idx}] to contain (width, height), got: {image_size}")
     return int(image_size[0]), int(image_size[1])
+
+
+def _normalized_grid_coordinates(
+    height: int,
+    width: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    append_newline: bool = False,
+) -> torch.Tensor:
+    cache_key = (
+        int(height), int(width), bool(append_newline), device.type, device.index, dtype
+    )
+    cached = _VISUAL_COORDINATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    y = torch.linspace(0.0, 1.0, max(1, int(height)), device=device, dtype=torch.float32)
+    x = torch.linspace(0.0, 1.0, max(1, int(width)), device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    coords = torch.stack((xx, yy), dim=-1)
+    if append_newline:
+        newline = torch.stack((torch.full_like(y, 1.05), y), dim=-1)[:, None, :]
+        coords = torch.cat((coords, newline), dim=1)
+    coords = coords.reshape(-1, 2).to(dtype=dtype)
+    _VISUAL_COORDINATE_CACHE[cache_key] = coords
+    return coords
 
 
 def _cached_causal_bool_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -311,6 +338,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             input_size=int(config["predictor_input_size"]),
             hidden_size=int(config["predictor_hidden_size"]),
             rank=int(config.get("predictor_rank", 128)),
+            num_heads=int(config.get("predictor_num_heads", 1)),
             rank_mlp_ratio=int(config.get("predictor_rank_mlp_ratio", 2)),
             use_visual_position=bool(config.get("predictor_use_visual_position", True)),
             use_text_position=bool(config.get("predictor_use_text_position", True)),
@@ -350,7 +378,9 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 except Exception:
                     pass
 
-    def _encode_and_merge_image_features(self, images: Any, image_sizes: Optional[Any] = None) -> List[torch.Tensor]:
+    def _encode_and_merge_image_features(
+        self, images: Any, image_sizes: Optional[Any] = None
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Match LlavaMetaForCausalLM.prepare_inputs_labels_for_multimodal image merging."""
 
         if isinstance(images, (list, tuple)) or (torch.is_tensor(images) and images.ndim == 5):
@@ -367,11 +397,20 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             if mm_patch_merge_type == "flat":
-                return [feature.flatten(0, 1) for feature in image_features]
+                merged = [feature.flatten(0, 1) for feature in image_features]
+                side = int(self.get_vision_tower().num_patches_per_side)
+                coordinates = [
+                    _normalized_grid_coordinates(side, side, device=flat.device, dtype=flat.dtype).repeat(
+                        feature.shape[0], 1
+                    )
+                    for feature, flat in zip(image_features, merged)
+                ]
+                return merged, coordinates
             if not mm_patch_merge_type.startswith("spatial"):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {mm_patch_merge_type}")
 
             merged_features: List[torch.Tensor] = []
+            merged_coordinates: List[torch.Tensor] = []
             vision_tower = self.get_vision_tower()
             for image_idx, image_feature in enumerate(image_features):
                 if image_feature.shape[0] > 1:
@@ -397,6 +436,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                         patch_image_feature = patch_image_feature.permute(4, 0, 2, 1, 3).contiguous()
                         patch_image_feature = patch_image_feature.flatten(1, 2).flatten(2, 3)
                         patch_image_feature = unpad_image(patch_image_feature, image_size)
+                        patch_height, patch_width = patch_image_feature.shape[-2:]
                         image_newline = self.model.image_newline.to(
                             device=patch_image_feature.device,
                             dtype=patch_image_feature.dtype,
@@ -409,25 +449,66 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                             dim=-1,
                         )
                         patch_image_feature = patch_image_feature.flatten(1, 2).transpose(0, 1)
+                        patch_coordinates = _normalized_grid_coordinates(
+                            patch_height,
+                            patch_width,
+                            device=patch_image_feature.device,
+                            dtype=patch_image_feature.dtype,
+                            append_newline=True,
+                        )
                     else:
                         patch_image_feature = patch_image_feature.permute(0, 2, 1, 3, 4).contiguous()
                         patch_image_feature = patch_image_feature.flatten(0, 3)
+                        patch_coordinates = _normalized_grid_coordinates(
+                            num_patch_height * height,
+                            num_patch_width * width,
+                            device=patch_image_feature.device,
+                            dtype=patch_image_feature.dtype,
+                        )
                     image_feature = torch.cat((base_image_feature, patch_image_feature), dim=0)
+                    base_coordinates = _normalized_grid_coordinates(
+                        height, width, device=image_feature.device, dtype=image_feature.dtype
+                    )
+                    image_coordinates = torch.cat((base_coordinates, patch_coordinates), dim=0)
                 else:
                     image_feature = image_feature[0]
+                    height = width = vision_tower.num_patches_per_side
                     if "unpad" in mm_patch_merge_type:
                         image_newline = self.model.image_newline.to(
                             device=image_feature.device,
                             dtype=image_feature.dtype,
                         )
                         image_feature = torch.cat((image_feature, image_newline[None]), dim=0)
+                        image_coordinates = _normalized_grid_coordinates(
+                            height, width, device=image_feature.device, dtype=image_feature.dtype
+                        )
+                        image_coordinates = torch.cat(
+                            (image_coordinates, image_coordinates.new_tensor([[1.05, 1.0]])), dim=0
+                        )
+                    else:
+                        image_coordinates = _normalized_grid_coordinates(
+                            height, width, device=image_feature.device, dtype=image_feature.dtype
+                        )
                 merged_features.append(image_feature)
-            return merged_features
+                merged_coordinates.append(image_coordinates)
+            return merged_features, merged_coordinates
 
         image_features = self.encode_images(images)
         if torch.is_tensor(image_features):
-            return [feature for feature in image_features]
-        return list(image_features)
+            merged = [feature for feature in image_features]
+        else:
+            merged = list(image_features)
+        coordinates = []
+        for feature in merged:
+            side = int(round(feature.shape[0] ** 0.5))
+            if side * side == feature.shape[0]:
+                coordinates.append(
+                    _normalized_grid_coordinates(side, side, device=feature.device, dtype=feature.dtype)
+                )
+            else:
+                x = torch.linspace(0.0, 1.0, feature.shape[0], device=feature.device, dtype=feature.dtype)
+                coordinates.append(torch.stack((x, torch.zeros_like(x)), dim=-1))
+        return merged, coordinates
 
     def _embed_multimodal_for_generation(
         self,
@@ -436,7 +517,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         image_sizes: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         model_device, _ = self._device_dtype()
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
@@ -445,11 +526,12 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if position_ids is None:
             position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
 
-        image_features = self._encode_and_merge_image_features(images, image_sizes=image_sizes)
+        image_features, image_coordinates = self._encode_and_merge_image_features(images, image_sizes=image_sizes)
 
         compact_input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         new_input_embeds: List[torch.Tensor] = []
         new_input_ids: List[torch.Tensor] = []
+        new_visual_coordinates: List[torch.Tensor] = []
         cur_image_idx = 0
         embed_tokens = self.get_model().embed_tokens
 
@@ -461,6 +543,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 cur_input_embeds = torch.cat([cur_input_embeds, cur_image_features[0:0].to(cur_input_embeds.dtype)], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_input_ids.append(cur_input_ids)
+                new_visual_coordinates.append(cur_input_embeds.new_zeros((cur_input_embeds.shape[0], 2)))
                 cur_image_idx += 1
                 continue
 
@@ -478,21 +561,28 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
 
             cur_new_embeds = []
             cur_new_ids = []
+            cur_new_coordinates = []
             for i in range(num_images + 1):
                 cur_new_embeds.append(text_embeds_split[i])
                 cur_new_ids.append(cur_input_ids_noim[i])
+                cur_new_coordinates.append(text_embeds_split[i].new_zeros((text_embeds_split[i].shape[0], 2)))
                 if i < num_images:
                     cur_image_features = image_features[cur_image_idx].to(
                         device=text_embeds_split[i].device,
                         dtype=text_embeds_split[i].dtype,
                     )
                     cur_image_idx += 1
+                    cur_image_coordinates = image_coordinates[cur_image_idx - 1].to(
+                        device=text_embeds_split[i].device, dtype=text_embeds_split[i].dtype
+                    )
                     visual_len = cur_image_features.shape[0]
                     cur_new_embeds.append(cur_image_features)
                     cur_new_ids.append(torch.full((visual_len,), IMAGE_TOKEN_INDEX, device=cur_input_ids.device, dtype=cur_input_ids.dtype))
+                    cur_new_coordinates.append(cur_image_coordinates)
 
             new_input_embeds.append(torch.cat([x.to(model_device) for x in cur_new_embeds], dim=0))
             new_input_ids.append(torch.cat(cur_new_ids, dim=0))
+            new_visual_coordinates.append(torch.cat(cur_new_coordinates, dim=0).to(model_device))
 
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
@@ -501,6 +591,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         padded_ids = torch.full((batch_size, max_len), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
         padded_attention = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         padded_position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+        padded_visual_coordinates = new_input_embeds[0].new_zeros((batch_size, max_len, 2))
 
         for i, (cur_embeds, cur_ids) in enumerate(zip(new_input_embeds, new_input_ids)):
             cur_len = cur_embeds.shape[0]
@@ -517,8 +608,15 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 padded_ids[i, :cur_len] = cur_ids
                 padded_attention[i, :cur_len] = True
                 padded_position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+                padded_visual_coordinates[i, :cur_len] = new_visual_coordinates[i]
 
-        return torch.stack(padded_embeds, dim=0), padded_ids, padded_attention, padded_position_ids
+        return (
+            torch.stack(padded_embeds, dim=0),
+            padded_ids,
+            padded_attention,
+            padded_position_ids,
+            padded_visual_coordinates,
+        )
 
     @torch.no_grad()
     def _learnable_scope_prune_prefill(
@@ -527,6 +625,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        visual_coordinates: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if input_ids.shape[0] != 1:
             raise ValueError("learnable-prune scope-finalwipe generation currently expects batch_size=1")
@@ -567,6 +666,12 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 predictor_inputs,
                 visual_positions=visual_positions,
                 text_positions=text_positions,
+                visual_coordinates=(
+                    visual_coordinates.index_select(1, visual_positions)
+                    if visual_coordinates is not None
+                    and bool(self.learnable_prune_config.get("predictor_use_true_visual_coordinates", False))
+                    else None
+                ),
             )[0]
             learnable_topk = int(getattr(self, "learnable_prune_keep_k", LEARNABLE_TOPK))
             topk = min(learnable_topk, int(scores.numel()))
@@ -928,6 +1033,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        visual_coordinates: Optional[torch.Tensor],
         use_cache: bool,
         output_attentions: bool,
         output_hidden_states: bool,
@@ -952,6 +1058,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            visual_coordinates=visual_coordinates,
         )
         mark_profile("scope")
         layers = self.model.layers
@@ -1178,6 +1285,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         learnable_prune_input_ids: Optional[torch.LongTensor] = None,
+        learnable_prune_visual_coordinates: Optional[torch.Tensor] = None,
         learnable_prune: bool = True,
         attn_anchor: str = MID_ATTN_ANCHOR,
         mid_target_count: Optional[int] = None,
@@ -1238,6 +1346,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                visual_coordinates=learnable_prune_visual_coordinates,
                 use_cache=bool(use_cache),
                 output_attentions=bool(output_attentions),
                 output_hidden_states=bool(output_hidden_states),
@@ -1336,6 +1445,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if pruned_attention_mask is not None:
             model_kwargs["_pruning_done"] = True
             model_kwargs["learnable_prune_input_ids"] = None
+            model_kwargs["learnable_prune_visual_coordinates"] = None
             model_kwargs["attention_mask"] = torch.cat(
                 [pruned_attention_mask, pruned_attention_mask.new_ones((pruned_attention_mask.shape[0], 1))],
                 dim=-1,
@@ -1348,6 +1458,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         past_key_values=None,
         inputs_embeds=None,
         learnable_prune_input_ids=None,
+        learnable_prune_visual_coordinates=None,
         attn_anchor=None,
         mid_target_count=None,
         **kwargs,
@@ -1360,6 +1471,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         )
         if self._is_initial_prefill_cache(past_key_values) and learnable_prune_input_ids is not None:
             model_inputs["learnable_prune_input_ids"] = learnable_prune_input_ids
+            model_inputs["learnable_prune_visual_coordinates"] = learnable_prune_visual_coordinates
             if attn_anchor is not None:
                 model_inputs["attn_anchor"] = attn_anchor
             if mid_target_count is not None:
@@ -1380,7 +1492,13 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None and inputs is not None and inputs.shape[1] > 1:
-            inputs_embeds, expanded_input_ids, attention_mask, position_ids = self._embed_multimodal_for_generation(
+            (
+                inputs_embeds,
+                expanded_input_ids,
+                attention_mask,
+                position_ids,
+                visual_coordinates,
+            ) = self._embed_multimodal_for_generation(
                 inputs,
                 images,
                 attention_mask,
@@ -1393,6 +1511,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
                 learnable_prune_input_ids=expanded_input_ids,
+                learnable_prune_visual_coordinates=visual_coordinates,
                 **kwargs,
             )
 
