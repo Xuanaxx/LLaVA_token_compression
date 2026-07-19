@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -37,7 +38,7 @@ MID_ATTN_ANCHOR = "query"
 FINAL_WIPE_LAYER_IDX = 25
 ENABLE_FINALWIPE = True
 ENABLE_PREDICTOR = True
-_SCOPE_GRAPH_CACHE: Dict[Tuple[Any, ...], Any] = {}
+_SCOPE_GRAPH_CACHE: "OrderedDict[Tuple[Any, ...], Any]" = OrderedDict()
 _CAUSAL_BOOL_MASK_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
 _VISUAL_COORDINATE_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
@@ -64,8 +65,9 @@ def _env_int_list(name: str, default: List[int]) -> List[int]:
     return parsed or [int(x) for x in default]
 
 
-def _enable_finalwipe() -> bool:
-    return _env_flag("ENABLE_FINALWIPE", ENABLE_FINALWIPE)
+def _enable_finalwipe(default: Optional[bool] = None) -> bool:
+    base = ENABLE_FINALWIPE if default is None else bool(default)
+    return _env_flag("ENABLE_FINALWIPE", base)
 
 
 def _enable_predictor() -> bool:
@@ -82,20 +84,23 @@ def _learnable_topk(default: Optional[int] = None) -> int:
     return _env_int("LEARNABLE_TOPK", base)
 
 
-def _scope_target_count() -> int:
-    return _env_int("SCOPE_TARGET_COUNT", SCOPE_TARGET_COUNT)
+def _scope_target_count(default: Optional[int] = None) -> int:
+    base = SCOPE_TARGET_COUNT if default is None else int(default)
+    return _env_int("SCOPE_TARGET_COUNT", base)
 
 
-def _mid_pruning_layer_idx() -> int:
-    return _env_int("MID_PRUNING_LAYER_IDX", MID_PRUNING_LAYER_IDX)
+def _mid_pruning_layer_idx(default: Optional[int] = None) -> int:
+    base = MID_PRUNING_LAYER_IDX if default is None else int(default)
+    return _env_int("MID_PRUNING_LAYER_IDX", base)
 
 
 def _final_wipe_layer_idx() -> int:
     return _env_int("FINAL_WIPE_LAYER_IDX", FINAL_WIPE_LAYER_IDX)
 
 
-def _final_wipe_layer_idxs() -> List[int]:
-    return _env_int_list("FINAL_WIPE_LAYER_IDX", [FINAL_WIPE_LAYER_IDX])
+def _final_wipe_layer_idxs(default: Optional[List[int]] = None) -> List[int]:
+    base = [FINAL_WIPE_LAYER_IDX] if default is None else [int(x) for x in default]
+    return _env_int_list("FINAL_WIPE_LAYER_IDX", base)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -192,7 +197,10 @@ class _SeededScopeCudaGraph:
         _seeded_scope_greedy_core(self.static_visual, self.static_seeds, self.target_keep)
         torch.cuda.synchronize(visual.device)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        # DataLoader pin-memory workers may allocate host buffers while the
+        # training thread captures this graph. Thread-local capture mode keeps
+        # those unrelated worker allocations from invalidating the capture.
+        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
             self.keep, self.cosine = _seeded_scope_greedy_core(
                 self.static_visual, self.static_seeds, self.target_keep
             )
@@ -210,6 +218,7 @@ def SeededResidualSCOPE(
     seed_relative: torch.Tensor,
     target_keep: int,
     spatial_bonus: float = 0.0,
+    use_cuda_graph: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if visual_feature_vectors.dim() != 3 or visual_feature_vectors.shape[0] != 1:
         raise ValueError("SeededResidualSCOPE expects visual_feature_vectors with shape [1, N, D].")
@@ -229,7 +238,14 @@ def SeededResidualSCOPE(
         seed_relative = seed_relative[(seed_relative >= 0) & (seed_relative < num_tokens)]
         seed_relative = torch.unique(seed_relative, sorted=False)
 
-    if visual_feature_vectors.is_cuda and seed_relative.numel() > 0 and spatial_bonus <= 0.0:
+    scope_graph_cache_size = max(0, _env_int("LEARNABLE_PRUNE_SCOPE_GRAPH_CACHE_SIZE", 4))
+    if (
+        use_cuda_graph
+        and scope_graph_cache_size > 0
+        and visual_feature_vectors.is_cuda
+        and seed_relative.numel() > 0
+        and spatial_bonus <= 0.0
+    ):
         key = (
             visual_feature_vectors.device.index,
             tuple(visual_feature_vectors.shape),
@@ -248,6 +264,10 @@ def SeededResidualSCOPE(
                 if _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False):
                     print(f"[learnable_prune_scope_graph] capture failed: {exc!r}", flush=True)
             _SCOPE_GRAPH_CACHE[key] = cached
+            while len(_SCOPE_GRAPH_CACHE) > scope_graph_cache_size:
+                _SCOPE_GRAPH_CACHE.popitem(last=False)
+        else:
+            _SCOPE_GRAPH_CACHE.move_to_end(key)
         if isinstance(cached, _SeededScopeCudaGraph):
             return cached(visual_feature_vectors, seed_relative)
 
@@ -334,6 +354,32 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             if checkpoint_dirs:
                 checkpoint = checkpoint_dirs[-1]
         config = torch.load(checkpoint / "learnable_prune_config.pt", map_location="cpu")
+        budget_profiles = [dict(profile) for profile in config.get("budget_profiles", [])]
+        requested_budget_value = os.environ.get(
+            "LEARNABLE_PRUNE_AVG_TOKEN_BUDGET",
+            os.environ.get("AVG_TOKEN_BUDGET"),
+        )
+        requested_budget = (
+            int(requested_budget_value)
+            if requested_budget_value is not None and requested_budget_value.strip() != ""
+            else int(config.get("default_avg_token_budget", -1))
+        )
+        selected_profile: Dict[str, Any] = {}
+        if budget_profiles:
+            named_budget_profiles = [
+                profile for profile in budget_profiles if int(profile.get("avg_token_budget", -1)) >= 0
+            ]
+            matching = [
+                profile
+                for profile in named_budget_profiles
+                if int(profile.get("avg_token_budget", -1)) == requested_budget
+            ]
+            if requested_budget_value is not None and named_budget_profiles and not matching:
+                supported = sorted(int(profile["avg_token_budget"]) for profile in named_budget_profiles)
+                raise ValueError(
+                    f"Requested average token budget {requested_budget} is not in checkpoint profiles {supported}."
+                )
+            selected_profile = matching[0] if matching else budget_profiles[0]
         predictor = LearnablePrunePredictor(
             input_size=int(config["predictor_input_size"]),
             hidden_size=int(config["predictor_hidden_size"]),
@@ -351,7 +397,36 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             param.requires_grad = False
         self.learnable_prune_predictor = predictor
         self.learnable_prune_config = dict(config)
-        self.learnable_prune_keep_k = _learnable_topk(int(config.get("keep_k", LEARNABLE_TOPK)))
+        self.learnable_prune_budget_profiles = budget_profiles
+        self.learnable_prune_active_budget_profile = dict(selected_profile)
+        self.learnable_prune_keep_k = _learnable_topk(
+            int(selected_profile.get("keep_k", config.get("keep_k", LEARNABLE_TOPK)))
+        )
+        self.learnable_prune_scope_target_count = int(
+            selected_profile.get("scope_target_count", config.get("scope_target_count", SCOPE_TARGET_COUNT))
+        )
+        self.learnable_prune_mid_pruning_layer_idx = int(
+            selected_profile.get(
+                "mid_pruning_layer_idx",
+                config.get("mid_pruning_layer_idx", MID_PRUNING_LAYER_IDX),
+            )
+        )
+        self.learnable_prune_mid_target_count = int(
+            selected_profile.get("mid_target_count", config.get("mid_target_count", MID_TARGET_COUNT))
+        )
+        self.learnable_prune_mid_attn_anchor = str(config.get("mid_attn_anchor", MID_ATTN_ANCHOR))
+        self.learnable_prune_final_wipe_layer_idx = int(
+            selected_profile.get(
+                "final_wipe_layer_idx",
+                config.get("final_wipe_layer_idx", FINAL_WIPE_LAYER_IDX),
+            )
+        )
+        self.learnable_prune_enable_final_wipe = bool(
+            selected_profile.get(
+                "enable_final_wipe",
+                config.get("enable_final_wipe", ENABLE_FINALWIPE),
+            )
+        )
         self.learnable_prune_checkpoint = str(checkpoint)
         self.learnable_prune_stats: List[Dict[str, Any]] = []
 
@@ -674,8 +749,11 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 ),
             )[0]
             learnable_topk = int(getattr(self, "learnable_prune_keep_k", LEARNABLE_TOPK))
-            topk = min(learnable_topk, int(scores.numel()))
-            top_relative = torch.topk(scores, k=topk).indices if topk > 0 else scores.new_empty((0,), dtype=torch.long)
+            top_indices, top_valid = predictor.budget_topk_indices(
+                scores.unsqueeze(0), learnable_topk
+            )
+            top_relative = top_indices[0, top_valid[0]]
+            topk = int(top_relative.numel())
         else:
             scores = inputs_embeds.new_empty((visual_positions.numel(),), dtype=torch.float32)
             topk = 0
@@ -683,7 +761,10 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if predictor_end is not None:
             predictor_end.record()
 
-        target_keep = min(_scope_target_count(), int(visual_positions.numel()))
+        target_keep = min(
+            _scope_target_count(getattr(self, "learnable_prune_scope_target_count", SCOPE_TARGET_COUNT)),
+            int(visual_positions.numel()),
+        )
         if target_keep > topk:
             visual_source = predictor_inputs if enable_predictor else inputs_embeds
             visual_embeds = visual_source.index_select(1, visual_positions)
@@ -723,6 +804,11 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 "learnable_topk_visual_tokens": int(topk),
                 "kept_visual_tokens": int(visual_keep.numel()),
                 "scope_target_visual_tokens": int(target_keep),
+                "avg_token_budget_profile": int(
+                    getattr(self, "learnable_prune_active_budget_profile", {}).get(
+                        "avg_token_budget", -1
+                    )
+                ),
                 "diversity_fill_method": "seeded_residual_scope",
                 "pruned_tokens": int(input_ids.shape[1] - keep_positions.numel()),
                 "checkpoint": getattr(self, "learnable_prune_checkpoint", None),
@@ -1037,7 +1123,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         use_cache: bool,
         output_attentions: bool,
         output_hidden_states: bool,
-        attn_anchor: str = MID_ATTN_ANCHOR,
+        attn_anchor: Optional[str] = None,
         mid_target_count: Optional[int] = None,
     ):
         profile_internal = _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False)
@@ -1062,11 +1148,25 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         )
         mark_profile("scope")
         layers = self.model.layers
-        enable_finalwipe = _enable_finalwipe()
-        final_wipe_layer_idxs = _final_wipe_layer_idxs()
+        enable_finalwipe = _enable_finalwipe(
+            getattr(self, "learnable_prune_enable_final_wipe", ENABLE_FINALWIPE)
+        )
+        final_wipe_layer_idxs = _final_wipe_layer_idxs(
+            [getattr(self, "learnable_prune_final_wipe_layer_idx", FINAL_WIPE_LAYER_IDX)]
+        )
         wipe_layer_idx = min(min(final_wipe_layer_idxs), len(layers)) if enable_finalwipe else len(layers)
-        mid_pruning_layer_idx = min(_mid_pruning_layer_idx(), wipe_layer_idx)
+        mid_pruning_layer_idx = min(
+            _mid_pruning_layer_idx(
+                getattr(self, "learnable_prune_mid_pruning_layer_idx", MID_PRUNING_LAYER_IDX)
+            ),
+            wipe_layer_idx,
+        )
         mid_scoring_layer_idx = min(mid_pruning_layer_idx, max(len(layers) - 1, 0))
+        mid_attn_anchor = str(
+            getattr(self, "learnable_prune_mid_attn_anchor", MID_ATTN_ANCHOR)
+            if attn_anchor is None
+            else attn_anchor
+        ).strip().lower()
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
@@ -1118,7 +1218,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             input_ids=scoped_input_ids,
             attention_mask=attention_mask,
             visual_positions=mid_visual_positions,
-            attn_anchor=str(attn_anchor).strip().lower(),
+            attn_anchor=mid_attn_anchor,
         )
         if mid_visual_positions.numel() > 0:
             mid_importance_scores = self._get_visual_token_attention_scores(
@@ -1132,7 +1232,12 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         else:
             mid_importance_scores = hidden_states.new_zeros((0,))
         mark_profile("mid_score")
-        mid_target_count_value = _mid_target_count(mid_target_count)
+        mid_target_default = (
+            getattr(self, "learnable_prune_mid_target_count", MID_TARGET_COUNT)
+            if mid_target_count is None
+            else int(mid_target_count)
+        )
+        mid_target_count_value = _mid_target_count(mid_target_default)
         hidden_states, mid_input_ids, mid_attention_mask, mid_position_ids, mid_scoped_keep_positions = self._prune_by_mid_attention_scores(
             hidden_states=hidden_states,
             input_ids=scoped_input_ids,
@@ -1201,7 +1306,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                     "enable_finalwipe": bool(enable_finalwipe),
                     "mid_pruning_layer_idx": int(mid_pruning_layer_idx),
                     "mid_scoring_layer_idx": int(mid_scoring_layer_idx),
-                    "mid_attn_anchor": str(attn_anchor).strip().lower(),
+                    "mid_attn_anchor": mid_attn_anchor,
                     "mid_query_count": int(mid_query_indices.numel()),
                     "mid_target_visual_tokens": int(mid_visual_tokens),
                     "avg_visual_tokens_budget": float(avg_visual_tokens_budget),

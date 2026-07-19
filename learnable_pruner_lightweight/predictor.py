@@ -3,7 +3,9 @@
 This module keeps the public class name, ``LearnablePrunePredictor``, and the
 same forward interface as the training wrapper expects, but reduces the
 architecture to the parts needed by the training target: prompt-conditioned
-TopK seed prediction.
+TopK seed prediction.  The learned logits intentionally define one shared
+ordering; deployment-budget profiles apply their own TopK value to that
+ordering through :meth:`LearnablePrunePredictor.budget_topk_indices`.
 
 Design:
     1. Shared down projection from LVLM hidden size to predictor width.
@@ -209,6 +211,73 @@ class LearnablePrunePredictor(nn.Module):
         nn.init.normal_(self.score.weight, mean=0.0, std=1.0 / math.sqrt(self.score.in_features))
         nn.init.zeros_(self.score.bias)
 
+    @staticmethod
+    def budget_topk_indices(
+        logits: torch.Tensor,
+        keep_k: int,
+        valid_mask: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select a budgeted TopK from one shared score ordering.
+
+        Args:
+            logits: Predictor scores shaped ``[B, Nv]``.
+            keep_k: Maximum number of tokens retained per sample.
+            valid_mask: Optional ``[B, Nv]`` mask for packed visual tokens.
+
+        Returns:
+            ``(indices, selected_valid)`` shaped ``[B, min(keep_k, Nv)]``.
+            ``selected_valid`` is false for padded slots when a sample has
+            fewer than ``keep_k`` valid visual tokens.
+
+        Keeping budget application outside the scoring network is deliberate:
+        all supported budgets train the same nested ranking, checkpoints need
+        no budget-specific predictor parameters, and inference can change a
+        profile without recomputing or recalibrating logits.
+        """
+        if logits.ndim != 2:
+            raise ValueError(f"logits must have shape [B, Nv], got {tuple(logits.shape)}")
+        if not logits.is_floating_point():
+            raise TypeError("logits must be floating point")
+        keep_k = int(keep_k)
+        if keep_k < 0:
+            raise ValueError(f"keep_k must be non-negative, got {keep_k}")
+        if valid_mask is None:
+            valid_mask = torch.ones_like(logits, dtype=torch.bool)
+        else:
+            if valid_mask.shape != logits.shape:
+                raise ValueError(
+                    f"valid_mask must match logits shape {tuple(logits.shape)}, "
+                    f"got {tuple(valid_mask.shape)}"
+                )
+            valid_mask = valid_mask.to(device=logits.device, dtype=torch.bool)
+
+        selected_width = min(keep_k, logits.shape[1])
+        if selected_width == 0:
+            empty_indices = torch.empty(
+                (logits.shape[0], 0), device=logits.device, dtype=torch.long
+            )
+            return empty_indices, torch.empty_like(empty_indices, dtype=torch.bool)
+
+        masked_logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+        indices = torch.topk(masked_logits, k=selected_width, dim=-1).indices
+        selected_valid = valid_mask.gather(dim=-1, index=indices)
+        return indices, selected_valid
+
+    @staticmethod
+    def budget_topk_mask(
+        logits: torch.Tensor,
+        keep_k: int,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return a boolean packed-token mask for ``budget_topk_indices``."""
+        indices, selected_valid = LearnablePrunePredictor.budget_topk_indices(
+            logits, keep_k, valid_mask
+        )
+        selected = torch.zeros_like(logits, dtype=torch.bool)
+        if indices.shape[1] > 0:
+            selected.scatter_(dim=-1, index=indices, src=selected_valid)
+        return selected
+
     def _gather_token_states(
         self,
         hidden_states: torch.Tensor,
@@ -231,11 +300,19 @@ class LearnablePrunePredictor(nn.Module):
         valid_mask = torch.zeros((bsz, max_tokens), device=hidden_states.device, dtype=torch.bool)
         if max_tokens > 0:
             batch_idx, seq_idx = token_mask.nonzero(as_tuple=True)
-            slot_idx = token_mask.long().cumsum(dim=1)[batch_idx, seq_idx] - 1
+            # ``nonzero`` is row-major. Derive each token's packed slot from
+            # per-row offsets instead of materializing a full BxS int64 cumsum.
+            # For long multimodal sequences this removes the largest temporary
+            # tensor from the predictor's packing path.
+            row_offsets = token_lengths.cumsum(dim=0) - token_lengths
+            slot_idx = torch.arange(seq_idx.numel(), device=seq_idx.device) - row_offsets[batch_idx]
             token_states[batch_idx, slot_idx] = hidden_states[batch_idx, seq_idx]
             if packed_auxiliary is not None:
                 packed_auxiliary[batch_idx, slot_idx] = auxiliary_states[batch_idx, seq_idx]
-            valid_mask[batch_idx, slot_idx] = True
+            valid_mask = (
+                torch.arange(max_tokens, device=hidden_states.device)[None, :]
+                < token_lengths[:, None]
+            )
         return token_states, valid_mask, packed_auxiliary
 
     def _maybe_add_text_position(self, text: torch.Tensor, text_valid: torch.Tensor) -> torch.Tensor:

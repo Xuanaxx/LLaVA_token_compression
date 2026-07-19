@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding: utf-8
-"""One-stage fixed-layer JS-divergence training for a lightweight LLaVA visual-token pruner.
+"""Stage-aligned JS-divergence training for a lightweight LLaVA visual-token pruner.
 
 This trainer implements a single integrated objective:
 
@@ -12,13 +12,15 @@ The selector teacher is computed from one fixed decoder layer, controlled by
 ``--teacher_layer`` and defaulting to layer 18.  This version intentionally does
 not run the dynamic candidate-layer search used by the original trainer.
 
-The soft-pruned branch follows the CoViPAL-style idea of adding log-retention
-biases to visual-token keys in the causal attention mask, but uses the frozen
-full model's output distribution as the main preservation target.  The retention
-gate is a hard-ST TopK gate: the forward path is exact hard TopK with zero
-retention for non-kept visual tokens, while the backward path uses a strictly
-budgeted soft TopK relaxation.  At inference only the predictor logits are
-needed; visual tokens are hard-pruned by TopK.
+By default the student branch mirrors inference in one segmented decoder pass:
+predictor TopK seeds are expanded by SeededResidualSCOPE before layer 0, visual
+tokens are pruned again from mid-layer attention importance, and all remaining
+visual tokens are removed at the final-wipe layer.  Physical packing keeps the
+student activations small.  A fixed-budget straight-through gate on the retained
+visual embeddings supplies an end-to-end surrogate gradient to the predictor.
+
+Multiple deployment budgets can share one predictor: a deterministic shuffled
+cycle activates one complete pruning profile per microbatch on every DDP rank.
 """
 
 from __future__ import annotations
@@ -26,13 +28,14 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
+import inspect
 import json
 import logging
 import math
 import os
 import random
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,10 +67,45 @@ from llava.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from llava.mm_utils import get_anyres_image_grid_shape, process_anyres_image, tokenizer_image_token  # noqa: E402
 from llava.model.llava_arch import unpad_image  # noqa: E402
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM  # noqa: E402
+from llava.model.learnable_prune_lightweight_scope_finalwipe.official_modeling import (  # noqa: E402
+    SeededResidualSCOPE as _inference_seeded_residual_scope,
+)
 
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
 _VISUAL_COORDINATE_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
+
+
+def validate_distributed_cuda_mapping() -> None:
+    """Fail before model loading when local ranks would alias visible GPUs."""
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if local_world_size <= 1:
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    visible_devices = [
+        value.strip()
+        for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if value.strip()
+    ]
+    if visible_devices and len(set(visible_devices)) != len(visible_devices):
+        raise RuntimeError(
+            "CUDA_VISIBLE_DEVICES contains duplicate entries, which would map multiple DDP ranks "
+            f"to one GPU: {visible_devices}."
+        )
+
+    visible_count = torch.cuda.device_count()
+    if visible_count < local_world_size:
+        raise RuntimeError(
+            "Distributed launch requested more local processes than visible CUDA devices: "
+            f"LOCAL_WORLD_SIZE={local_world_size}, torch.cuda.device_count()={visible_count}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}. "
+            "Accelerate maps local ranks modulo the visible-device count, which would duplicate GPUs."
+        )
+    if not 0 <= local_rank < local_world_size:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside [0, {local_world_size - 1}]."
+        )
 
 
 def seed_everything(seed: int = 42, deterministic: bool = False) -> None:
@@ -96,6 +134,80 @@ def parse_bool_flag(value):
     if value in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
+def parse_budget_profiles(value: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """Parse semicolon-separated multi-budget profiles.
+
+    Each entry is
+    ``avg:topk:scope:mid_layer:mid_target:final_layer[:enable_finalwipe]``.
+    Example: ``160:272:340:12:80:25;320:544:680:12:160:25``.
+    """
+
+    if value is None or str(value).strip() == "":
+        return None
+    profiles: List[Dict[str, Any]] = []
+    for raw_profile in str(value).split(";"):
+        parts = [part.strip() for part in raw_profile.split(":")]
+        if len(parts) not in {6, 7}:
+            raise argparse.ArgumentTypeError(
+                "Each budget profile must contain 6 or 7 colon-separated values: "
+                "avg:topk:scope:mid_layer:mid_target:final_layer[:enable_finalwipe]. "
+                f"Got {raw_profile!r}."
+            )
+        try:
+            avg, topk, scope, mid_layer, mid_target, final_layer = map(int, parts[:6])
+            enable_finalwipe = parse_bool_flag(parts[6]) if len(parts) == 7 else True
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"Invalid budget profile {raw_profile!r}: {exc}") from exc
+        profiles.append(
+            {
+                "avg_token_budget": avg,
+                "keep_k": topk,
+                "scope_target_count": scope,
+                "mid_pruning_layer_idx": mid_layer,
+                "mid_target_count": mid_target,
+                "final_wipe_layer_idx": final_layer,
+                "enable_final_wipe": bool(enable_finalwipe),
+            }
+        )
+    if len({profile["avg_token_budget"] for profile in profiles}) != len(profiles):
+        raise argparse.ArgumentTypeError("avg_token_budget values must be unique within --budget_profiles.")
+    return profiles
+
+
+def _canonical_budget_profiles(profiles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not profiles:
+        raise ValueError("At least one budget profile is required.")
+    canonical = []
+    required = {
+        "avg_token_budget",
+        "keep_k",
+        "scope_target_count",
+        "mid_pruning_layer_idx",
+        "mid_target_count",
+        "final_wipe_layer_idx",
+    }
+    for profile in profiles:
+        missing = required - set(profile)
+        if missing:
+            raise ValueError(f"Budget profile is missing required fields: {sorted(missing)}")
+        canonical.append(
+            {
+                "avg_token_budget": int(profile["avg_token_budget"]),
+                "keep_k": int(profile["keep_k"]),
+                "scope_target_count": int(profile["scope_target_count"]),
+                "mid_pruning_layer_idx": int(profile["mid_pruning_layer_idx"]),
+                "mid_target_count": int(profile["mid_target_count"]),
+                "final_wipe_layer_idx": int(profile["final_wipe_layer_idx"]),
+                "enable_final_wipe": bool(profile.get("enable_final_wipe", True)),
+            }
+        )
+    if len({profile["avg_token_budget"] for profile in canonical}) != len(canonical):
+        raise ValueError("Budget profile avg_token_budget values must be unique.")
+    if any(profile["avg_token_budget"] < 0 for profile in canonical):
+        raise ValueError("Budget profile avg_token_budget values must be non-negative.")
+    return canonical
 
 
 class IndexedDataset(Dataset):
@@ -378,20 +490,10 @@ def _cleanup_distributed() -> None:
         torch.distributed.destroy_process_group()
 
 
-def _optimized_sdpa_context():
-    """Use math SDPA for differentiable dense attention-mask biases.
+def _default_checkpoint_contexts():
+    """Checkpoint contexts for masks that do not require gradients."""
 
-    PyTorch's memory-efficient CUDA backend can accept the forward inputs used
-    here but fail during backward with an incorrectly aligned LSE buffer when a
-    4D additive mask requires gradients (especially under checkpoint replay).
-    Math SDPA is the reliable backend for this uncommon mask-gradient path.
-    """
-
-    return torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
-
-
-def _optimized_sdpa_checkpoint_contexts():
-    return _optimized_sdpa_context(), _optimized_sdpa_context()
+    return nullcontext(), nullcontext()
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -405,23 +507,21 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def _make_4d_causal_mask(
     attention_mask: torch.Tensor,
     dtype: torch.dtype,
-    key_log_bias: Optional[torch.Tensor] = None,
+    *,
+    boolean: bool = False,
 ) -> torch.Tensor:
-    """Build an additive causal mask, optionally with per-key log-retention bias.
-
-    key_log_bias has shape [B, S].  A negative value at key position j reduces
-    every query's attention probability to key j before softmax.  Disallowed
-    causal/padding positions are still set to dtype minimum.
-    """
+    """Build an additive causal mask for a physically packed student batch."""
 
     _, seq_len = attention_mask.shape
     device = attention_mask.device
+    if boolean:
+        # PyTorch SDPA interprets True as visible. A bool mask uses half the
+        # storage of BF16 (one quarter of FP32) and avoids fill/add kernels.
+        causal_keep = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).tril_()
+        return causal_keep[None, None, :, :] & attention_mask[:, None, None, :].bool()
     min_dtype = torch.finfo(dtype).min
     causal_mask = torch.full((seq_len, seq_len), min_dtype, device=device, dtype=dtype).triu_(diagonal=1)
-    if key_log_bias is None:
-        key_bias = torch.zeros_like(attention_mask, dtype=dtype)
-    else:
-        key_bias = key_log_bias.to(device=device, dtype=dtype)
+    key_bias = torch.zeros_like(attention_mask, dtype=dtype)
     key_bias = key_bias.masked_fill(~attention_mask.bool(), min_dtype)
     # Broadcasting avoids materializing a BxSxS boolean `allowed` tensor and a
     # second dense zero tensor before producing the additive attention mask.
@@ -468,6 +568,35 @@ def _normalized_grid_coordinates(
     coords = coords.reshape(-1, 2).to(dtype=dtype)
     _VISUAL_COORDINATE_CACHE[cache_key] = coords
     return coords
+
+
+@torch.no_grad()
+def _seeded_residual_scope_indices(
+    visual_feature_vectors: torch.Tensor,
+    seed_relative: torch.Tensor,
+    target_keep: int,
+) -> torch.Tensor:
+    """Match inference SeededResidualSCOPE for one unpadded visual sequence.
+
+    The similarity matrix is intentionally row-local and transient.  This avoids
+    padding an anyres batch to ``B x Nmax x Nmax`` and bounds peak memory by the
+    largest single sample, exactly as the inference implementation does.
+    """
+
+    if visual_feature_vectors.dim() != 2:
+        raise ValueError("visual_feature_vectors must have shape [N, D].")
+    selected, _ = _inference_seeded_residual_scope(
+        visual_feature_vectors.unsqueeze(0).float(),
+        seed_relative,
+        int(target_keep),
+        spatial_bonus=0.0,
+        # The shared implementation uses thread-local CUDA capture, so pin-memory
+        # DataLoader workers can keep running. Fixed-grid batches then replay the
+        # complete greedy loop as one graph instead of issuing hundreds of tiny
+        # Python-dispatched kernels. CPU and unsupported CUDA paths stay eager.
+        use_cuda_graph=True,
+    )
+    return selected[0]
 
 
 class _BudgetedSigmoidTopK(torch.autograd.Function):
@@ -553,7 +682,7 @@ class LearnablePruneWrapper(nn.Module):
         self,
         llava_model: nn.Module,
         predictor: LearnablePrunePredictor,
-        keep_k: int = 64,
+        budget_profiles: List[Dict[str, Any]],
         teacher_layer: int = 18,
         rank_loss_weight: float = 1.0,
         js_loss_weight: float = 1.0,
@@ -563,13 +692,13 @@ class LearnablePruneWrapper(nn.Module):
         topk_hinge_margin: float = 1.0,
         kd_temperature: float = 1.0,
         budgeted_soft_topk_iters: int = 32,
+        budget_schedule_seed: int = 42,
         teacher_target_log_dir: Optional[str] = None,
         teacher_target_log_to_console: bool = False,
     ):
         super().__init__()
         self.llava = llava_model
         self.predictor = predictor
-        self.keep_k = int(keep_k)
         self.teacher_layer = int(teacher_layer)
         self.rank_loss_weight = float(rank_loss_weight)
         self.js_loss_weight = float(js_loss_weight)
@@ -579,9 +708,14 @@ class LearnablePruneWrapper(nn.Module):
         self.topk_hinge_margin = float(topk_hinge_margin)
         self.kd_temperature = float(kd_temperature)
         self.budgeted_soft_topk_iters = int(budgeted_soft_topk_iters)
+        self.budget_profiles = _canonical_budget_profiles(budget_profiles)
+        self.budget_schedule_seed = int(budget_schedule_seed)
+        self._active_budget_profile_index = 0
+        self._budget_schedule_cached_cycle = -1
+        self._budget_schedule_cached_order: Optional[torch.Tensor] = None
+        self._apply_budget_profile(0)
         self._training_progress = 0.0
         self._last_soft_budget_error: Optional[torch.Tensor] = None
-        self.attention_gate_mode = "hard_st"
 
         self.teacher_target_log_to_console = bool(teacher_target_log_to_console)
         self._teacher_target_global_step = -1
@@ -604,10 +738,130 @@ class LearnablePruneWrapper(nn.Module):
             raise ValueError("topk_hinge_margin must be positive")
         if self.budgeted_soft_topk_iters <= 0:
             raise ValueError("budgeted_soft_topk_iters must be positive")
+        num_layers = len(getattr(self.llava.model, "layers", []))
+        self._decoder_layer_forward_parameters = (
+            set(inspect.signature(self.llava.model.layers[0].forward).parameters)
+            if num_layers > 0
+            else set()
+        )
+        for profile in self.budget_profiles:
+            if min(profile["keep_k"], profile["scope_target_count"], profile["mid_target_count"]) < 0:
+                raise ValueError(f"Budget counts must be non-negative, got: {profile}")
+            if profile["keep_k"] > profile["scope_target_count"]:
+                raise ValueError(
+                    "Predictor keep_k cannot exceed the SCOPE target count; "
+                    f"got profile={profile}."
+                )
+            if profile["mid_target_count"] > profile["scope_target_count"]:
+                raise ValueError(
+                    "The mid-stage target cannot exceed the SCOPE target count; "
+                    f"got profile={profile}."
+                )
+            if not (
+                0
+                <= profile["mid_pruning_layer_idx"]
+                <= profile["final_wipe_layer_idx"]
+                <= num_layers
+            ):
+                raise ValueError(
+                    "Three-stage layer indices must satisfy 0 <= mid <= final <= num_layers; "
+                    f"got profile={profile}, num_layers={num_layers}."
+                )
+            final_target = 0 if profile["enable_final_wipe"] else profile["mid_target_count"]
+            computed_average = (
+                profile["mid_pruning_layer_idx"] * profile["scope_target_count"]
+                + (
+                    profile["final_wipe_layer_idx"]
+                    - profile["mid_pruning_layer_idx"]
+                )
+                * profile["mid_target_count"]
+                + (num_layers - profile["final_wipe_layer_idx"]) * final_target
+            ) / float(max(num_layers, 1))
+            if abs(computed_average - profile["avg_token_budget"]) > 1.0:
+                raise ValueError(
+                    "Budget profile label does not match its layer-wise average for this model: "
+                    f"declared={profile['avg_token_budget']}, computed={computed_average:.3f}, "
+                    f"num_layers={num_layers}, profile={profile}."
+                )
 
         for param in self.llava.parameters():
             param.requires_grad = False
         self.llava.eval()
+        # DDP's initialization broadcast otherwise includes every frozen LLaVA
+        # parameter even though its gradient reducer correctly tracks only the
+        # predictor. Ignoring frozen parameters removes a full ~13-26 GiB model
+        # broadcast per rank and its transient coalescing buffers. All ranks load
+        # those immutable weights from the same checkpoint before DDP wrapping.
+        frozen_parameter_names = [
+            name for name, parameter in self.named_parameters() if not parameter.requires_grad
+        ]
+        torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+            self, frozen_parameter_names
+        )
+
+    def _apply_budget_profile(self, profile_index: int) -> None:
+        profile_index = int(profile_index)
+        if not 0 <= profile_index < len(self.budget_profiles):
+            raise IndexError(
+                f"Budget profile index {profile_index} is outside [0, {len(self.budget_profiles) - 1}]."
+            )
+        profile = self.budget_profiles[profile_index]
+        self._active_budget_profile_index = profile_index
+        # Existing pruning helpers intentionally read these scalar attributes;
+        # switching them once before forward keeps their hot paths branch-free.
+        self.keep_k = int(profile["keep_k"])
+        self.scope_target_count = int(profile["scope_target_count"])
+        self.mid_pruning_layer_idx = int(profile["mid_pruning_layer_idx"])
+        self.mid_target_count = int(profile["mid_target_count"])
+        self.final_wipe_layer_idx = int(profile["final_wipe_layer_idx"])
+        self.enable_final_wipe = bool(profile["enable_final_wipe"])
+
+    @property
+    def active_budget_profile(self) -> Dict[str, Any]:
+        return dict(self.budget_profiles[self._active_budget_profile_index])
+
+    def budget_profile_index_for_micro_step(self, micro_step: int) -> int:
+        """Balanced shuffled-cycle schedule, deterministic and identical on every DDP rank."""
+
+        profile_count = len(self.budget_profiles)
+        if profile_count <= 1:
+            return 0
+        cycle, offset = divmod(max(0, int(micro_step)), profile_count)
+        if cycle != self._budget_schedule_cached_cycle or self._budget_schedule_cached_order is None:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.budget_schedule_seed + cycle)
+            self._budget_schedule_cached_order = torch.randperm(profile_count, generator=generator)
+            self._budget_schedule_cached_cycle = cycle
+        return int(self._budget_schedule_cached_order[offset].item())
+
+    def set_budget_micro_step(self, micro_step: int) -> Dict[str, Any]:
+        self._apply_budget_profile(self.budget_profile_index_for_micro_step(micro_step))
+        return self.active_budget_profile
+
+    def _budget_output_metrics(
+        self,
+        reference: torch.Tensor,
+        *,
+        total_loss: torch.Tensor,
+        rank_loss: torch.Tensor,
+        js_loss: torch.Tensor,
+        ce_loss: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        profile = self.active_budget_profile
+        zero = reference.detach() * 0.0
+        avg_budget = int(profile["avg_token_budget"])
+        budget_label = str(avg_budget)
+        return {
+            "active_budget_profile_index": zero + float(self._active_budget_profile_index),
+            "active_avg_token_budget": zero + float(avg_budget),
+            "active_keep_k": zero + float(profile["keep_k"]),
+            "active_scope_target_count": zero + float(profile["scope_target_count"]),
+            "active_mid_target_count": zero + float(profile["mid_target_count"]),
+            f"budget_{budget_label}_total_loss": total_loss.detach(),
+            f"budget_{budget_label}_rank_loss": rank_loss.detach(),
+            f"budget_{budget_label}_js_loss": js_loss.detach(),
+            f"budget_{budget_label}_ce_loss": ce_loss.detach(),
+        }
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -623,7 +877,7 @@ class LearnablePruneWrapper(nn.Module):
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {
                 "use_reentrant": False,
-                "context_fn": _optimized_sdpa_checkpoint_contexts,
+                "context_fn": _default_checkpoint_contexts,
             }
         if hasattr(self.llava, "gradient_checkpointing_enable"):
             try:
@@ -655,31 +909,6 @@ class LearnablePruneWrapper(nn.Module):
 
     def _current_ce_loss_weight(self) -> float:
         return self.ce_loss_weight * self._loss_weight_scale(0.2, 2.0)
-
-    @contextmanager
-    def _temporary_attention_backend(self, backend: str):
-        configs = []
-        for obj in (
-            getattr(self.llava, "model", None),
-            getattr(self.llava, "config", None),
-            getattr(getattr(self.llava, "config", None), "text_config", None),
-        ):
-            config = getattr(obj, "config", obj)
-            if config is not None and hasattr(config, "_attn_implementation"):
-                configs.append(config)
-        seen = set()
-        originals = []
-        for config in configs:
-            if id(config) in seen:
-                continue
-            seen.add(id(config))
-            originals.append((config, config._attn_implementation))
-            config._attn_implementation = backend
-        try:
-            yield
-        finally:
-            for config, original in originals:
-                config._attn_implementation = original
 
     @contextmanager
     def _temporary_decoder_checkpoint_training(self):
@@ -1092,12 +1321,37 @@ class LearnablePruneWrapper(nn.Module):
         query_valid = query_valid.to(device=query_projected.device)
         score_sum = query_projected.new_zeros((bsz, visual_positions.shape[1]), dtype=torch.float32)
 
-        # One device-to-host synchronization supplies all small row sizes;
-        # it replaces a much costlier padded B x H x Qmax x Smax computation.
+        # One device-to-host synchronization supplies all small row sizes.
+        # Uniform/near-uniform batches take a vectorized path; highly ragged
+        # anyres batches retain the row path to avoid padding quadratic work.
         row_sizes = torch.stack(
             (attention_mask.sum(dim=-1), visual_valid.sum(dim=-1), query_valid.sum(dim=-1)),
             dim=-1,
         ).to(device="cpu", dtype=torch.long).tolist()
+        true_attention_work = sum(key_count * query_count for key_count, _, query_count in row_sizes)
+        true_delta_work = sum(visual_count * query_count for _, visual_count, query_count in row_sizes)
+        padded_attention_work = bsz * seq_len * query_positions.shape[1]
+        padded_delta_work = bsz * visual_positions.shape[1] * query_positions.shape[1]
+        padding_ratio = max(
+            padded_attention_work / float(max(true_attention_work, 1)),
+            padded_delta_work / float(max(true_delta_work, 1)),
+        )
+        max_padding_ratio = float(os.environ.get("LEARNABLE_PRUNE_BATCHED_SCORE_MAX_PADDING", "1.5"))
+        if padding_ratio <= max_padding_ratio:
+            return self._get_visual_token_attention_scores_batched(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                self_attn=self_attn,
+                scaling=scaling,
+                attention_mask=attention_mask,
+                visual_positions=visual_positions,
+                visual_valid=visual_valid,
+                query_positions=query_positions,
+                query_valid=query_valid,
+                hidden_size=hidden_size,
+            )
+
         left_padding = getattr(self.llava.config, "tokenizer_padding_side", "right") == "left"
         for batch_idx, (key_count, visual_count, query_count) in enumerate(row_sizes):
             if visual_count == 0 or query_count == 0:
@@ -1141,6 +1395,82 @@ class LearnablePruneWrapper(nn.Module):
 
             row_score_sum.div_(float(query_count))
         return score_sum
+
+    @staticmethod
+    def _get_visual_token_attention_scores_batched(
+        *,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        self_attn: nn.Module,
+        scaling: float,
+        attention_mask: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_valid: torch.Tensor,
+        query_positions: torch.Tensor,
+        query_valid: torch.Tensor,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        """Vectorized leave-one-out scoring for low-padding batches.
+
+        Query chunks bound the transient ``[B, Q, Nv, hidden]`` perturbation.
+        This collapses the former batch-row loop into larger GEMMs for fixed-grid
+        LLaVA batches while preserving the ragged fallback for LLaVA-NeXT.
+        """
+
+        bsz, num_heads, _, head_dim = query_states.shape
+        query_count = query_positions.shape[1]
+        visual_count = visual_positions.shape[1]
+        if query_count == 0 or visual_count == 0:
+            return query_states.new_zeros((bsz, visual_count), dtype=torch.float32)
+
+        q_index = query_positions[:, None, :, None].expand(bsz, num_heads, query_count, head_dim)
+        packed_query = query_states.gather(dim=2, index=q_index)
+        v_index = visual_positions[:, None, :, None].expand(bsz, num_heads, visual_count, head_dim)
+        visual_value = value_states.gather(dim=2, index=v_index).permute(0, 2, 1, 3).contiguous()
+        key_transposed = key_states.transpose(2, 3)
+        key_positions = torch.arange(key_states.shape[2], device=key_states.device)
+
+        # Keep both delta_z and o_proj(delta_z) near this budget at peak. The
+        # minimum chunk is one query, so unusually large anyres rows still make
+        # progress without allocating a full Qmax perturbation tensor.
+        temporary_mib = max(16, int(os.environ.get("LEARNABLE_PRUNE_SCORE_TEMP_MIB", "128")))
+        target_elements = (temporary_mib << 20) // max(query_states.element_size(), 1)
+        elements_per_query = max(1, bsz * visual_count * hidden_size)
+        query_chunk = max(1, min(query_count, target_elements // elements_per_query))
+        score_sum = query_states.new_zeros((bsz, visual_count), dtype=torch.float32)
+
+        for chunk_start in range(0, query_count, query_chunk):
+            chunk_end = min(chunk_start + query_chunk, query_count)
+            q_pos = query_positions[:, chunk_start:chunk_end]
+            q_valid = query_valid[:, chunk_start:chunk_end]
+            q_states = packed_query[:, :, chunk_start:chunk_end, :]
+            attn_scores = torch.matmul(q_states, key_transposed) * scaling
+            allowed = (
+                attention_mask[:, None, None, :].bool()
+                & q_valid[:, None, :, None]
+                & (key_positions[None, None, None, :] <= q_pos[:, None, :, None])
+            )
+            attn_probs = F.softmax(
+                attn_scores.float().masked_fill(~allowed, torch.finfo(torch.float32).min),
+                dim=-1,
+            ).to(dtype=q_states.dtype)
+            z_heads = torch.matmul(attn_probs, value_states).permute(0, 2, 1, 3).contiguous()
+
+            alpha_index = visual_positions[:, None, None, :].expand(
+                bsz, num_heads, chunk_end - chunk_start, visual_count
+            )
+            alpha_visual = attn_probs.gather(dim=-1, index=alpha_index).permute(0, 2, 3, 1).contiguous()
+            beta = alpha_visual / (1.0 - alpha_visual).clamp(min=1e-6)
+            delta_z = beta.unsqueeze(-1) * (z_heads.unsqueeze(2) - visual_value.unsqueeze(1))
+            delta_y = self_attn.o_proj(delta_z.flatten(0, 2).flatten(1, 2)).view(
+                bsz, chunk_end - chunk_start, visual_count, hidden_size
+            )
+            chunk_scores = delta_y.float().norm(dim=-1)
+            chunk_scores = chunk_scores * q_valid[:, :, None] * visual_valid[:, None, :]
+            score_sum.add_(chunk_scores.sum(dim=1))
+
+        return score_sum / query_valid.sum(dim=-1, keepdim=True).clamp_min(1).float()
 
     def _teacher_targets(
         self,
@@ -1288,10 +1618,10 @@ class LearnablePruneWrapper(nn.Module):
     def _retention_probabilities(
         self,
         predictor_logits: torch.Tensor,
-        teacher_valid: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return hard-ST visual retention gates and log-biases."""
-        valid = teacher_valid.bool()
+        visual_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return hard-ST visual retention gates for physical three-stage pruning."""
+        valid = visual_valid.bool()
         soft = self._budgeted_soft_topk_gate(predictor_logits, valid)
         valid_counts = valid.sum(dim=-1)
         keep_counts = valid_counts.clamp(max=self.keep_k)
@@ -1299,33 +1629,338 @@ class LearnablePruneWrapper(nn.Module):
             soft.detach().float().sum(dim=-1) - keep_counts.float()
         ).abs().mean()
 
-        topk_count = min(self.keep_k, predictor_logits.shape[1])
-        hard = torch.zeros_like(predictor_logits)
-        if topk_count > 0:
-            masked_logits = predictor_logits.masked_fill(~valid, torch.finfo(predictor_logits.dtype).min)
-            topk_indices = torch.topk(masked_logits, k=topk_count, dim=-1).indices
-            hard.scatter_(1, topk_indices, 1.0)
-        hard = hard * valid.to(dtype=hard.dtype)
+        hard = self.predictor.budget_topk_mask(
+            predictor_logits, self.keep_k, valid
+        ).to(dtype=predictor_logits.dtype)
         gate = hard + soft - soft.detach()
-        probs = torch.where(valid, gate, torch.ones_like(gate))
+        return torch.where(valid, gate, torch.ones_like(gate))
 
-        min_log_bias = torch.finfo(torch.float32).min
-        soft_log_bias = torch.log(soft.float().clamp_min(1e-6))
-        hard_log_bias = torch.where(
-            hard.bool(),
-            torch.zeros_like(soft_log_bias),
-            torch.full_like(soft_log_bias, min_log_bias),
+    def _pack_by_keep_mask(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Physically pack variable-length rows and right-pad only to the batch maximum."""
+
+        keep_mask = keep_mask.bool() & attention_mask.bool()
+        counts = keep_mask.sum(dim=-1)
+        min_count, max_count = torch.aminmax(counts)
+        min_count_host, max_count_host = torch.stack((min_count, max_count)).to(device="cpu").tolist()
+        if min_count_host == 0:
+            raise ValueError("Three-stage pruning cannot remove every token from a sequence.")
+        max_count_host = int(max_count_host)
+
+        batch_idx, seq_idx = keep_mask.nonzero(as_tuple=True)
+        row_offsets = counts.cumsum(dim=0) - counts
+        slot_idx = torch.arange(seq_idx.numel(), device=seq_idx.device) - row_offsets[batch_idx]
+        packed_source_positions = torch.zeros(
+            (keep_mask.shape[0], max_count_host), device=keep_mask.device, dtype=torch.long
         )
-        log_biases = hard_log_bias + soft_log_bias - soft_log_bias.detach()
-        log_biases = torch.where(valid, log_biases, torch.zeros_like(log_biases))
-        return probs, log_biases
+        packed_source_positions[batch_idx, slot_idx] = seq_idx
+        packed_attention = (
+            torch.arange(max_count_host, device=attention_mask.device)[None, :] < counts[:, None]
+        )
+
+        hidden_index = packed_source_positions.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+        packed_hidden = hidden_states.gather(dim=1, index=hidden_index)
+        packed_hidden.masked_fill_(~packed_attention.unsqueeze(-1), 0)
+        packed_ids = input_ids.gather(dim=1, index=packed_source_positions)
+        packed_positions = position_ids.gather(dim=1, index=packed_source_positions)
+        packed_labels = labels.gather(dim=1, index=packed_source_positions)
+        pad_token_id = int(getattr(self.llava.config, "pad_token_id", 0) or 0)
+        packed_ids.masked_fill_(~packed_attention, pad_token_id)
+        packed_positions.masked_fill_(~packed_attention, 0)
+        packed_labels.masked_fill_(~packed_attention, IGNORE_INDEX)
+        packed_attention = packed_attention.to(dtype=attention_mask.dtype)
+        return packed_hidden, packed_ids, packed_attention, packed_positions, packed_labels
+
+    def _run_decoder_layer_range(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        start_layer: int,
+        end_layer: int,
+    ) -> torch.Tensor:
+        """Run a contiguous decoder segment without a second model forward."""
+
+        if start_layer >= end_layer:
+            return hidden_states
+        language_model = self.llava.model
+        use_boolean_mask = str(getattr(language_model.config, "_attn_implementation", "eager")) == "sdpa"
+        causal_mask = _make_4d_causal_mask(
+            attention_mask, dtype=hidden_states.dtype, boolean=use_boolean_mask
+        )
+        cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
+        position_embeddings = language_model.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx in range(int(start_layer), int(end_layer)):
+            layer = language_model.layers[layer_idx]
+            parameters = self._decoder_layer_forward_parameters
+            kwargs: Dict[str, Any] = {
+                "attention_mask": causal_mask,
+                "position_ids": position_ids,
+            }
+            if "use_cache" in parameters:
+                kwargs["use_cache"] = False
+            if "output_attentions" in parameters:
+                kwargs["output_attentions"] = False
+            if "cache_position" in parameters:
+                kwargs["cache_position"] = cache_position
+            if "position_embeddings" in parameters:
+                kwargs["position_embeddings"] = position_embeddings
+            layer_outputs = layer(hidden_states, **kwargs)
+            hidden_states = layer_outputs[0] if isinstance(layer_outputs, (tuple, list)) else layer_outputs
+        return hidden_states
+
+    def _scope_stage_keep_mask(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        predictor_logits: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select predictor seeds and fill to the inference SCOPE budget."""
+
+        keep_mask = attention_mask.bool() & input_ids.ne(int(IMAGE_TOKEN_INDEX))
+        visual_counts = visual_valid.sum(dim=-1).to(device="cpu", dtype=torch.long).tolist()
+        with torch.no_grad():
+            detached_logits = predictor_logits.detach().float()
+            seed_indices, seed_valid = self.predictor.budget_topk_indices(
+                detached_logits, self.keep_k, visual_valid
+            )
+            for batch_idx, visual_count in enumerate(visual_counts):
+                if visual_count <= 0:
+                    continue
+                row_positions = visual_positions[batch_idx, :visual_count]
+                seeds = seed_indices[batch_idx, seed_valid[batch_idx]]
+                target_count = min(self.scope_target_count, visual_count)
+                selected_relative = _seeded_residual_scope_indices(
+                    inputs_embeds[batch_idx].index_select(0, row_positions),
+                    seeds,
+                    target_count,
+                )
+                selected_positions = row_positions.index_select(0, selected_relative)
+                keep_mask[batch_idx, selected_positions] = True
+        return keep_mask
+
+    def _mid_stage_attention_scores(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        scoring_layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute inference-equivalent mid-stage scores from prompt-visible queries."""
+
+        visual_mask = input_ids.eq(int(IMAGE_TOKEN_INDEX)) & attention_mask.bool()
+        visual_positions, visual_valid = self._pack_mask_positions(visual_mask)
+        if visual_positions.shape[1] == 0:
+            return hidden_states.new_zeros(visual_valid.shape, dtype=torch.float32), visual_positions, visual_valid
+
+        sequence_positions = torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
+        visual_end = torch.where(
+            visual_mask,
+            sequence_positions,
+            torch.full_like(sequence_positions, -1),
+        ).amax(dim=-1)
+        prompt_text_mask = (
+            attention_mask.bool()
+            & input_ids.ne(int(IMAGE_TOKEN_INDEX))
+            & labels.eq(IGNORE_INDEX)
+        )
+        query_mask = prompt_text_mask & (sequence_positions > visual_end[:, None])
+        # Match inference's last-text fallback without allowing supervised answer
+        # tokens to leak into normal training-time importance estimates.
+        any_text_mask = attention_mask.bool() & input_ids.ne(int(IMAGE_TOKEN_INDEX))
+        fallback_mask = torch.where(
+            prompt_text_mask.any(dim=-1, keepdim=True),
+            prompt_text_mask,
+            any_text_mask,
+        )
+        fallback_positions = torch.where(
+            fallback_mask,
+            sequence_positions,
+            torch.full_like(sequence_positions, -1),
+        ).amax(dim=-1)
+        fallback_rows = ~query_mask.any(dim=-1) & fallback_positions.ge(0)
+        fallback_batch = fallback_rows.nonzero(as_tuple=False).flatten()
+        query_mask[fallback_batch, fallback_positions[fallback_batch]] = True
+        query_positions, query_valid = self._pack_mask_positions(query_mask)
+
+        scoring_layer = self.llava.model.layers[int(scoring_layer_idx)]
+        with torch.no_grad():
+            normed = scoring_layer.input_layernorm(hidden_states.detach())
+            self_attn = scoring_layer.self_attn
+            projected_qkv = {
+                "query": self_attn.q_proj(normed),
+                "key": self_attn.k_proj(normed),
+                "value": self_attn.v_proj(normed),
+            }
+            scores = self._get_visual_token_attention_scores(
+                projected_qkv=projected_qkv,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                scoring_layer_idx=int(scoring_layer_idx),
+                visual_positions=visual_positions,
+                visual_valid=visual_valid,
+                query_positions=query_positions,
+                query_valid=query_valid,
+            )
+        return scores, visual_positions, visual_valid
+
+    def _mid_stage_keep_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        importance_scores: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        keep_mask = attention_mask.bool() & input_ids.ne(int(IMAGE_TOKEN_INDEX))
+        with torch.no_grad():
+            selected_relative, selected_valid = self.predictor.budget_topk_indices(
+                importance_scores.float(), self.mid_target_count, visual_valid
+            )
+            if selected_relative.shape[1] > 0:
+                selected_positions = visual_positions.gather(dim=1, index=selected_relative)
+                selected_batch = torch.arange(keep_mask.shape[0], device=keep_mask.device)[:, None]
+                selected_batch = selected_batch.expand_as(selected_positions)
+                keep_mask[
+                    selected_batch[selected_valid], selected_positions[selected_valid]
+                ] = True
+        return keep_mask
+
+    def _three_stage_student_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        predictor_logits: torch.Tensor,
+        retention_probs: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Run scope -> mid-attention -> final-wipe in one compact student pass."""
+
+        scope_keep_mask = self._scope_stage_keep_mask(
+            inputs_embeds,
+            input_ids,
+            attention_mask,
+            predictor_logits,
+            visual_positions,
+            visual_valid,
+        )
+        # Forward value is exactly one for every visual token.  Its derivative is
+        # the fixed-budget soft TopK derivative, so hard physical packing remains
+        # inference-faithful while JS/CE still optimize the predictor end to end.
+        visual_st_gate = torch.ones_like(retention_probs) + (
+            retention_probs - retention_probs.detach()
+        )
+        sequence_gate = inputs_embeds.new_ones(attention_mask.shape)
+        visual_mask = input_ids.eq(int(IMAGE_TOKEN_INDEX)) & attention_mask.bool()
+        sequence_gate[visual_mask] = visual_st_gate[visual_valid].to(dtype=sequence_gate.dtype)
+        gated_inputs = inputs_embeds * sequence_gate.unsqueeze(-1)
+        hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = self._pack_by_keep_mask(
+            gated_inputs,
+            input_ids,
+            attention_mask,
+            position_ids,
+            labels,
+            scope_keep_mask,
+        )
+        scope_visual_counts = (
+            stage_ids.eq(int(IMAGE_TOKEN_INDEX)) & stage_attention.bool()
+        ).sum(dim=-1)
+
+        num_layers = len(self.llava.model.layers)
+        mid_layer = min(self.mid_pruning_layer_idx, num_layers)
+        wipe_layer = min(self.final_wipe_layer_idx, num_layers) if self.enable_final_wipe else num_layers
+        hidden_states = self._run_decoder_layer_range(
+            hidden_states, stage_attention, stage_positions, 0, mid_layer
+        )
+
+        scoring_layer_idx = min(mid_layer, max(num_layers - 1, 0))
+        mid_scores, mid_visual_positions, mid_visual_valid = self._mid_stage_attention_scores(
+            hidden_states,
+            stage_ids,
+            stage_attention,
+            stage_positions,
+            stage_labels,
+            scoring_layer_idx,
+        )
+        mid_keep_mask = self._mid_stage_keep_mask(
+            stage_ids,
+            stage_attention,
+            mid_scores,
+            mid_visual_positions,
+            mid_visual_valid,
+        )
+        hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = self._pack_by_keep_mask(
+            hidden_states,
+            stage_ids,
+            stage_attention,
+            stage_positions,
+            stage_labels,
+            mid_keep_mask,
+        )
+        mid_visual_counts = (
+            stage_ids.eq(int(IMAGE_TOKEN_INDEX)) & stage_attention.bool()
+        ).sum(dim=-1)
+        hidden_states = self._run_decoder_layer_range(
+            hidden_states, stage_attention, stage_positions, mid_layer, wipe_layer
+        )
+
+        if self.enable_final_wipe:
+            final_keep_mask = stage_attention.bool() & stage_ids.ne(int(IMAGE_TOKEN_INDEX))
+            hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = self._pack_by_keep_mask(
+                hidden_states,
+                stage_ids,
+                stage_attention,
+                stage_positions,
+                stage_labels,
+                final_keep_mask,
+            )
+        final_visual_counts = (
+            stage_ids.eq(int(IMAGE_TOKEN_INDEX)) & stage_attention.bool()
+        ).sum(dim=-1)
+        hidden_states = self._run_decoder_layer_range(
+            hidden_states, stage_attention, stage_positions, wipe_layer, num_layers
+        )
+        hidden_states = self.llava.model.norm(hidden_states)
+
+        avg_visual_budget = (
+            float(mid_layer) * scope_visual_counts.float()
+            + float(wipe_layer - mid_layer) * mid_visual_counts.float()
+            + float(num_layers - wipe_layer) * final_visual_counts.float()
+        ) / float(max(num_layers, 1))
+        stats = {
+            "scope_visual_tokens": scope_visual_counts.float().mean(),
+            "mid_visual_tokens": mid_visual_counts.float().mean(),
+            "final_visual_tokens": final_visual_counts.float().mean(),
+            "avg_visual_tokens_budget": avg_visual_budget.mean(),
+            "student_sequence_tokens": stage_attention.sum(dim=-1).float().mean(),
+        }
+        return hidden_states, stage_attention, stage_labels, stats
 
     def _selector_loss(
         self,
         predictor_logits: torch.Tensor,
         teacher_scores: torch.Tensor,
         teacher_valid: torch.Tensor,
+        keep_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        keep_k = self.keep_k if keep_k is None else int(keep_k)
         valid = teacher_valid.bool()
         counts = valid.sum(dim=-1)
         metric_rows = counts > 1
@@ -1350,7 +1985,7 @@ class LearnablePruneWrapper(nn.Module):
         ).clamp_min(1e-6)
         selector_spearman = (spearman_per_row * metric_rows).sum() / metric_denom
 
-        topk_count = min(self.keep_k, pred.shape[1])
+        topk_count = min(keep_k, pred.shape[1])
         if topk_count == 0:
             zero = pred.sum() * 0.0
             return zero, selector_spearman, zero, zero
@@ -1358,11 +1993,11 @@ class LearnablePruneWrapper(nn.Module):
         pred_top_idx = torch.topk(pred.masked_fill(~valid, neg_inf), k=topk_count, dim=-1).indices
         teacher_top = torch.zeros_like(valid).scatter(1, teacher_top_idx, True) & valid
         pred_top = torch.zeros_like(valid).scatter(1, pred_top_idx, True) & valid
-        keep_counts = counts.clamp(max=self.keep_k).clamp_min(1)
+        keep_counts = counts.clamp(max=keep_k).clamp_min(1)
         overlap_per_row = (teacher_top & pred_top).sum(dim=-1).float() / keep_counts.float()
         selector_topk_overlap = (overlap_per_row * metric_rows).sum() / metric_denom
 
-        boundary_rows = counts > self.keep_k
+        boundary_rows = counts > keep_k
         boundary_denom = boundary_rows.sum().clamp_min(1).float()
         negatives = valid & ~teacher_top
         margin_scores = (pred + self.topk_hinge_margin * negatives).masked_fill(~valid, neg_inf)
@@ -1374,23 +2009,13 @@ class LearnablePruneWrapper(nn.Module):
         hard_neg_idx = torch.topk(pred.masked_fill(~negatives, neg_inf), k=topk_count, dim=-1).indices
         pos_logits = pred.gather(1, teacher_top_idx)
         neg_logits = pred.gather(1, hard_neg_idx)
-        neg_counts = (counts - self.keep_k).clamp(min=0, max=topk_count)
+        neg_counts = (counts - keep_k).clamp(min=0, max=topk_count)
         neg_slots = torch.arange(topk_count, device=pred.device)[None, :] < neg_counts[:, None]
         comparisons = (pos_logits[:, :, None] > neg_logits[:, None, :]) & neg_slots[:, None, :]
         comparison_count = (topk_count * neg_counts).clamp_min(1).float()
         boundary_per_row = comparisons.sum(dim=(1, 2)).float() / comparison_count
         selector_boundary_accuracy = (boundary_per_row * boundary_rows).sum() / boundary_denom
         return rank_loss, selector_spearman, selector_topk_overlap, selector_boundary_accuracy
-
-    def _build_visual_key_log_bias(
-        self,
-        visual_token_mask: torch.Tensor,
-        teacher_valid: torch.Tensor,
-        retention_log_bias: torch.Tensor,
-    ) -> torch.Tensor:
-        key_log_bias = retention_log_bias.new_zeros(visual_token_mask.shape, dtype=torch.float32)
-        key_log_bias[visual_token_mask] = retention_log_bias[teacher_valid].float()
-        return key_log_bias
 
     def _answer_token_mask(
         self,
@@ -1537,9 +2162,22 @@ class LearnablePruneWrapper(nn.Module):
                 "current_rank_loss_weight": zero.detach() + self._current_rank_loss_weight(),
                 "current_js_loss_weight": zero.detach() + self._current_js_loss_weight(),
                 "current_ce_loss_weight": zero.detach() + self._current_ce_loss_weight(),
+                "scope_visual_tokens": zero.detach(),
+                "mid_visual_tokens": zero.detach(),
+                "final_visual_tokens": zero.detach(),
+                "avg_visual_tokens_budget": zero.detach(),
+                "student_sequence_tokens": expanded_attention_mask.sum(dim=-1).float().mean(),
+                **self._budget_output_metrics(
+                    zero,
+                    total_loss=zero,
+                    rank_loss=zero,
+                    js_loss=zero,
+                    ce_loss=zero,
+                ),
             }
 
         visual_token_mask = expanded_input_ids.eq(int(IMAGE_TOKEN_INDEX)) & expanded_attention_mask.bool()
+        visual_positions, visual_valid = self._pack_mask_positions(visual_token_mask)
         prompt_text_mask = (
             expanded_attention_mask.bool()
             & expanded_labels.eq(IGNORE_INDEX)
@@ -1553,48 +2191,48 @@ class LearnablePruneWrapper(nn.Module):
             visual_coordinates=expanded_visual_coordinates,
         )
 
-        retention_probs, retention_log_bias = self._retention_probabilities(predictor_logits, teacher_valid)
+        retention_probs = self._retention_probabilities(predictor_logits, visual_valid)
+        selector_by_keep_k = {
+            keep_k: self._selector_loss(
+                predictor_logits=predictor_logits,
+                teacher_scores=teacher_scores,
+                teacher_valid=teacher_valid,
+                keep_k=keep_k,
+            )
+            for keep_k in sorted({int(profile["keep_k"]) for profile in self.budget_profiles})
+        }
         (
-            rank_loss,
+            _active_rank_loss,
             selector_spearman,
             selector_topk_overlap,
             selector_boundary_accuracy,
-        ) = self._selector_loss(
-            predictor_logits=predictor_logits,
-            teacher_scores=teacher_scores,
-            teacher_valid=teacher_valid,
-        )
+        ) = selector_by_keep_k[self.keep_k]
+        # Ranking boundaries for every configured predictor TopK are cheap and
+        # shared every step; only the expensive staged JS/CE branch is sampled.
+        rank_loss = torch.stack([values[0] for values in selector_by_keep_k.values()]).mean()
 
-        key_log_bias = self._build_visual_key_log_bias(
-            visual_token_mask,
-            teacher_valid,
-            retention_log_bias,
-        )
-        soft_prune_attention_mask = _make_4d_causal_mask(
-            attention_mask=expanded_attention_mask,
-            dtype=inputs_embeds.dtype,
-            key_log_bias=key_log_bias,
-        )
-        # A differentiable dense additive mask requires math SDPA; the efficient
-        # CUDA backend currently fails its LSE alignment check during backward.
-        with (
-            self._temporary_attention_backend("sdpa"),
-            self._temporary_decoder_checkpoint_training(),
-            _optimized_sdpa_context(),
-        ):
-            pruned_outputs = self.llava.model(
+        with self._temporary_decoder_checkpoint_training():
+            (
+                pruned_hidden_states,
+                student_attention_mask,
+                student_labels,
+                stage_stats,
+            ) = self._three_stage_student_forward(
                 inputs_embeds=inputs_embeds,
-                attention_mask=soft_prune_attention_mask,
+                input_ids=expanded_input_ids,
+                attention_mask=expanded_attention_mask,
                 position_ids=original_position_ids,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
+                labels=expanded_labels,
+                predictor_logits=predictor_logits,
+                retention_probs=retention_probs,
+                visual_positions=visual_positions,
+                visual_valid=visual_valid,
             )
         js_loss, ce_loss = self._js_ce_losses(
             teacher_logits,
-            pruned_outputs.last_hidden_state,
-            expanded_attention_mask,
-            labels=expanded_labels,
+            pruned_hidden_states,
+            student_attention_mask,
+            labels=student_labels,
         )
 
         weighted_rank_loss = self._current_rank_loss_weight() * rank_loss
@@ -1602,7 +2240,13 @@ class LearnablePruneWrapper(nn.Module):
         weighted_ce_loss = self._current_ce_loss_weight() * ce_loss
         loss = weighted_rank_loss + weighted_js_loss + weighted_ce_loss
 
-        if not bool(torch.isfinite(loss).item()):
+        finite_loss = torch.isfinite(loss)
+        if loss.is_cuda:
+            # Queue the check without synchronizing the training stream every
+            # microbatch. A failing assertion is surfaced at the next natural
+            # synchronization point (DDP/logging/backward).
+            torch._assert_async(finite_loss, "Non-finite learnable-prune loss")
+        elif not bool(finite_loss.item()):
             details = {
                 "rank_loss": float(rank_loss.detach().float().item()),
                 "js_loss": float(js_loss.detach().float().item()),
@@ -1652,6 +2296,14 @@ class LearnablePruneWrapper(nn.Module):
             "current_rank_loss_weight": loss.detach() * 0.0 + self._current_rank_loss_weight(),
             "current_js_loss_weight": loss.detach() * 0.0 + self._current_js_loss_weight(),
             "current_ce_loss_weight": loss.detach() * 0.0 + self._current_ce_loss_weight(),
+            **{key: value.detach() for key, value in stage_stats.items()},
+            **self._budget_output_metrics(
+                loss,
+                total_loss=loss,
+                rank_loss=rank_loss,
+                js_loss=js_loss,
+                ce_loss=ce_loss,
+            ),
         }
 
 
@@ -1675,6 +2327,16 @@ class LearnablePruneTrainer(Trainer):
         "current_rank_loss_weight",
         "current_js_loss_weight",
         "current_ce_loss_weight",
+        "scope_visual_tokens",
+        "mid_visual_tokens",
+        "final_visual_tokens",
+        "avg_visual_tokens_budget",
+        "student_sequence_tokens",
+        "active_budget_profile_index",
+        "active_avg_token_budget",
+        "active_keep_k",
+        "active_scope_target_count",
+        "active_mid_target_count",
     )
 
     def __init__(self, *args, **kwargs):
@@ -1682,12 +2344,19 @@ class LearnablePruneTrainer(Trainer):
         self.model_accepts_loss_kwargs = False
         self._pending_loss_metrics: List[Dict[str, torch.Tensor]] = []
         self._scale_total_steps_cache: Optional[int] = None
+        self._budget_micro_step: Optional[int] = None
 
-    def _metric_scalar(self, value: torch.Tensor) -> float:
-        tensor = value.detach().float().reshape(1)
+    def _metric_scalars(self, values: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """Reduce every pending scalar with one cross-rank collective."""
+
+        if not values:
+            return {}
+        keys = sorted(values)
+        packed = torch.stack([values[key].detach().float().reshape(()) for key in keys]).unsqueeze(0)
         if hasattr(self, "accelerator") and self.accelerator is not None:
-            tensor = self.accelerator.gather_for_metrics(tensor)
-        return float(tensor.mean().item())
+            packed = self.accelerator.gather_for_metrics(packed)
+        packed = packed.reshape(-1, len(keys)).mean(dim=0).to(device="cpu")
+        return {key: float(value) for key, value in zip(keys, packed.tolist())}
 
     def _current_train_progress(self) -> float:
         total_steps = self._infer_total_train_steps()
@@ -1735,23 +2404,51 @@ class LearnablePruneTrainer(Trainer):
                 candidate.set_training_log_step(global_step)
                 return
 
+    @staticmethod
+    def _maybe_set_budget_micro_step(model: nn.Module, micro_step: int) -> None:
+        candidates = [model, getattr(model, "module", None)]
+        for candidate in candidates:
+            if candidate is not None and hasattr(candidate, "set_budget_micro_step"):
+                candidate.set_budget_micro_step(micro_step)
+                return
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self._budget_micro_step is None:
+            global_step = int(getattr(self.state, "global_step", 0) or 0)
+            grad_accum = max(1, int(getattr(self.args, "gradient_accumulation_steps", 1) or 1))
+            self._budget_micro_step = global_step * grad_accum
+        self._maybe_set_budget_micro_step(model, self._budget_micro_step)
+        self._budget_micro_step += 1
         self._maybe_set_training_progress(model, self._current_train_progress())
         self._maybe_set_training_log_step(model, int(getattr(self.state, "global_step", 0) or 0))
         outputs = model(**inputs)
         loss = outputs["loss"]
         self._pending_loss_metrics.append(
-            {key: outputs[key].detach().float().reshape(1) for key in self.loss_metric_keys if key in outputs}
+            {
+                key: value.detach().float().reshape(1)
+                for key, value in outputs.items()
+                if torch.is_tensor(value) and (key in self.loss_metric_keys or key.startswith("budget_"))
+            }
         )
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         if self._pending_loss_metrics:
             keys = sorted({key for metrics in self._pending_loss_metrics for key in metrics})
+            local_means: Dict[str, torch.Tensor] = {}
             for key in keys:
                 values = [metrics[key] for metrics in self._pending_loss_metrics if key in metrics]
                 if values:
-                    logs[key] = self._metric_scalar(torch.stack(values, dim=0).mean())
+                    local_means[key] = torch.stack(values, dim=0).mean()
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+                local_means["cuda_peak_memory_gib"] = torch.tensor(
+                    torch.cuda.max_memory_allocated(device) / float(1 << 30), device=device
+                )
+                local_means["cuda_reserved_memory_gib"] = torch.tensor(
+                    torch.cuda.memory_reserved(device) / float(1 << 30), device=device
+                )
+            logs.update(self._metric_scalars(local_means))
             self._pending_loss_metrics.clear()
         super().log(logs, start_time=start_time)
 
@@ -1764,9 +2461,12 @@ class LearnablePruneTrainer(Trainer):
         if hasattr(model, "module"):
             model = model.module
         torch.save(model.predictor.state_dict(), os.path.join(output_dir, "predictor.pt"))
+        default_profile = model.budget_profiles[0]
         config = {
-            "training_variant": "one_stage_fixed_layer_js_budgeted_hard_st_topk_precision_hinge_tclm_multihead_rank_swiglu",
-            "keep_k": model.keep_k,
+            "training_variant": "three_stage_scope_mid_finalwipe_fixed_layer_js_packed_hard_st"
+            + ("_multibudget" if len(model.budget_profiles) > 1 else "")
+            + "_tclm_multihead_rank_swiglu",
+            "keep_k": int(default_profile["keep_k"]),
             "teacher_layer": model.teacher_layer,
             "rank_loss_weight": model.rank_loss_weight,
             "js_loss_weight": model.js_loss_weight,
@@ -1777,12 +2477,23 @@ class LearnablePruneTrainer(Trainer):
             "teacher_layer_quality": "fixed_layer",
             "teacher_layer_pooling": "fixed_single_layer",
             "kd_temperature": model.kd_temperature,
-            "attention_gate_mode": model.attention_gate_mode,
+            "attention_gate_mode": "packed_embedding_hard_st",
             "budgeted_soft_topk_iters": model.budgeted_soft_topk_iters,
+            "training_pruning_mode": "three_stage",
+            "scope_target_count": int(default_profile["scope_target_count"]),
+            "mid_pruning_layer_idx": int(default_profile["mid_pruning_layer_idx"]),
+            "mid_target_count": int(default_profile["mid_target_count"]),
+            "mid_attn_anchor": "query",
+            "final_wipe_layer_idx": int(default_profile["final_wipe_layer_idx"]),
+            "enable_final_wipe": bool(default_profile["enable_final_wipe"]),
+            "budget_profiles": [dict(profile) for profile in model.budget_profiles],
+            "default_avg_token_budget": int(default_profile["avg_token_budget"]),
+            "budget_schedule": "balanced_shuffled_microbatch",
+            "budget_schedule_seed": model.budget_schedule_seed,
             "teacher_target_logging": model._teacher_target_logger is not None or model.teacher_target_log_to_console,
             "predictor_input_context": "pre_llm_visual_tokens_plus_unlabeled_prompt_tokens",
             "distillation_loss": "jensen_shannon_full_vocabulary",
-            "distillation_mask_type": "covipal_style_visual_key_log_retention_bias",
+            "distillation_mask_type": "physical_scope_mid_finalwipe_with_packed_embedding_st",
             "predictor_input_size": model.predictor.input_size,
             "predictor_hidden_size": model.predictor.hidden_size,
             "predictor_rank": getattr(model.predictor, "rank", None),
@@ -1797,7 +2508,7 @@ class LearnablePruneTrainer(Trainer):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train fixed-layer lightweight learnable visual-token pruner")
+    parser = argparse.ArgumentParser(description="Train stage-aligned lightweight learnable visual-token pruner")
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--data_path", type=str, default=None)
@@ -1811,7 +2522,6 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Randomly sample this fraction of the training set after max_samples is applied. Use 0.1 for 10%%.",
     )
-    parser.add_argument("--keep_k", type=int, default=160)
     parser.add_argument("--teacher_layer", type=int, default=18)
     parser.add_argument("--predictor_hidden_size", type=int, default=512)
     parser.add_argument("--predictor_rank", type=int, default=256)
@@ -1835,6 +2545,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk_hinge_margin", type=float, default=1.0)
     parser.add_argument("--kd_temperature", type=float, default=1.0)
     parser.add_argument("--budgeted_soft_topk_iters", type=int, default=16)
+    parser.add_argument(
+        "--budget_profiles",
+        type=parse_budget_profiles,
+        required=True,
+        help=(
+            "Semicolon-separated avg:topk:scope:mid_layer:mid_target:final_layer profiles. "
+            "One profile is activated for every microbatch using a balanced shuffled cycle."
+        ),
+    )
+    parser.add_argument(
+        "--budget_schedule_seed",
+        type=int,
+        default=None,
+        help="Seed for the DDP-identical balanced shuffled budget cycle; defaults to --seed.",
+    )
     parser.add_argument("--teacher_target_log_dir", type=str, default=None)
     parser.add_argument("--teacher_target_log_to_console", type=parse_bool_flag, default=False)
 
@@ -1869,6 +2594,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    validate_distributed_cuda_mapping()
     seed_everything(args.seed)
     if not (0.0 < args.sample_rate <= 1.0):
         raise ValueError("--sample_rate must be in (0, 1].")
@@ -1904,7 +2630,7 @@ def main() -> None:
         args.model_name_or_path,
         config=config,
         low_cpu_mem_usage=True,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation=args.attn_implementation,
     )
     llava.config.use_cache = False
@@ -1919,7 +2645,7 @@ def main() -> None:
     if args.gradient_checkpointing and hasattr(llava, "gradient_checkpointing_enable"):
         gradient_checkpointing_kwargs = {
             "use_reentrant": False,
-            "context_fn": _optimized_sdpa_checkpoint_contexts,
+            "context_fn": _default_checkpoint_contexts,
         }
         try:
             llava.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -1939,7 +2665,7 @@ def main() -> None:
     model = LearnablePruneWrapper(
         llava_model=llava,
         predictor=predictor,
-        keep_k=args.keep_k,
+        budget_profiles=args.budget_profiles,
         teacher_layer=args.teacher_layer,
         rank_loss_weight=args.rank_loss_weight,
         js_loss_weight=args.js_loss_weight,
@@ -1949,6 +2675,7 @@ def main() -> None:
         topk_hinge_margin=args.topk_hinge_margin,
         kd_temperature=args.kd_temperature,
         budgeted_soft_topk_iters=args.budgeted_soft_topk_iters,
+        budget_schedule_seed=(args.seed if args.budget_schedule_seed is None else args.budget_schedule_seed),
         teacher_target_log_dir=args.teacher_target_log_dir,
         teacher_target_log_to_console=args.teacher_target_log_to_console,
     )
@@ -1998,6 +2725,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         remove_unused_columns=False,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
+        ddp_broadcast_buffers=False,
         report_to=report_to,
         run_name=args.run_name,
         dataloader_num_workers=args.dataloader_num_workers,

@@ -110,9 +110,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     learnable_prune_scope_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_scope_finalwipe_model", False))
     learnable_prune_lightweight_scope_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_lightweight_scope_finalwipe_model", False))
     learnable_prune_scope_recover_finalwipe_model = _coerce_bool(kwargs.pop("learnable_prune_scope_recover_finalwipe_model", False))
+    best_layer_sweep_model = _coerce_bool(kwargs.pop("best_layer_sweep_model", False))
     importance_pruning_correlation_model = _coerce_bool(kwargs.pop("importance_pruning_correlation_model", False))
-    if importance_pruning_correlation_model:
-        from llava.model.importance_pruning_correlation import LlavaImportancePruningCorrelationForCausalLM
+    if best_layer_sweep_model or importance_pruning_correlation_model:
+        from best_layer_sweep import LlavaBestLayerSweepForCausalLM
         from llava.model.language_model.llava_llama import LlavaConfig
 
         kwargs.pop("multimodal", None)
@@ -123,7 +124,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         resolved_vision_tower = _resolve_vision_tower_path(getattr(config, "mm_vision_tower", None))
         if resolved_vision_tower is not None:
             config.mm_vision_tower = resolved_vision_tower
-        model = LlavaImportancePruningCorrelationForCausalLM.from_pretrained(
+        model = LlavaBestLayerSweepForCausalLM.from_pretrained(
             model_path,
             config=config,
             low_cpu_mem_usage=True,
