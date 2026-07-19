@@ -85,13 +85,13 @@ if [[ "$MODEL_SIZE" != "7b" && "$MODEL_SIZE" != "13b" ]]; then
   exit 2
 fi
 
-# The 7B profiles exactly match the H100 LLaVA-v1.5 evaluation script. The 13B
+# TopK is 80% of each SCOPE target, rounded to the nearest token. The 13B
 # fallback keeps the same layer boundaries and nominal average budgets over its
 # 40 decoder layers (64.1/127.9/192.0 after integer rounding).
 if [[ "$MODEL_SIZE" == "7b" ]]; then
-  DEFAULT_BUDGET_PROFILES="64:64:137:12:32:25;128:64:272:12:64:25;192:64:408:12:96:25"
+  DEFAULT_BUDGET_PROFILES="64:110:137:12:32:25;128:218:272:12:64:25;192:326:408:12:96:25"
 else
-  DEFAULT_BUDGET_PROFILES="64:64:179:12:32:25;128:64:357:12:64:25;192:64:536:12:96:25"
+  DEFAULT_BUDGET_PROFILES="64:143:179:12:32:25;128:286:357:12:64:25;192:429:536:12:96:25"
 fi
 # Format: avg:topk:scope:mid_layer:mid_target:final_layer
 # This is the sole pruning-budget source; one complete profile is selected per microbatch.
@@ -103,10 +103,10 @@ DATA_DIR=${DATA_DIR:-"/data2/czx/data/llava_1_5_mix665k_full"}
 DATA_PATH=${DATA_PATH:-}
 IMAGE_FOLDER=${IMAGE_FOLDER:-}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
-RUN_NAME=${RUN_NAME:-"official_llava_v1.5_${MODEL_SIZE}_learnable_prune_lightweight_top64_multibudget64_128_192_layer18_sample0.2"}
+TEACHER_LAYER=${TEACHER_LAYER:-18}
+RUN_NAME=${RUN_NAME:-"official_llava_v1.5_${MODEL_SIZE}_learnable_prune_lightweight_top80pctscope_multibudget64_128_192_layer${TEACHER_LAYER}_sample0.2"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}
-TEACHER_LAYER=${TEACHER_LAYER:-18}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
 IMAGE_ASPECT_RATIO=${IMAGE_ASPECT_RATIO:-pad}
 

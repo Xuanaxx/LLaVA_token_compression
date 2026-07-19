@@ -7,7 +7,7 @@ fi
 source /data1/chenzixuan/uv_env/.tokencompression/bin/activate
 cd /data1/chenzixuan/open_source_projects/LLaVA_token_compression/learnable_pruner_lightweight
 
-GPU_IDS=${GPU_IDS:-0,1}
+GPU_IDS=${GPU_IDS:-0,2}
 IFS=',' read -r -a GPU_ID_ARRAY <<< "$GPU_IDS"
 declare -A GPU_ID_SEEN=()
 for index in "${!GPU_ID_ARRAY[@]}"; do
@@ -94,7 +94,7 @@ DATA_DIR=${DATA_DIR:-"/data2/czx/data/llava_1_5_mix665k_full"}
 DATA_PATH=${DATA_PATH:-}
 IMAGE_FOLDER=${IMAGE_FOLDER:-}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
-TEACHER_LAYER=${TEACHER_LAYER:-18}
+TEACHER_LAYER=${TEACHER_LAYER:-16}
 RUN_NAME=${RUN_NAME:-"official_llava_next_7b_learnable_prune_lightweight_top80pctscope_multibudget160_320_640_layer${TEACHER_LAYER}_sample0.2"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}

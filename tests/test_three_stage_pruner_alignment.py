@@ -63,13 +63,17 @@ def test_authoritative_budget_profiles_and_balanced_schedule():
     assert [profile["mid_target_count"] for profile in next_profiles] == [80, 160, 320]
 
     v15_profiles = parse_budget_profiles(
-        "64:64:137:12:32:25;128:64:272:12:64:25;192:64:408:12:96:25"
+        "64:110:137:12:32:25;128:218:272:12:64:25;192:326:408:12:96:25"
     )
     assert v15_profiles is not None
     assert [profile["avg_token_budget"] for profile in v15_profiles] == [64, 128, 192]
-    assert [profile["keep_k"] for profile in v15_profiles] == [64, 64, 64]
+    assert [profile["keep_k"] for profile in v15_profiles] == [110, 218, 326]
     assert [profile["scope_target_count"] for profile in v15_profiles] == [137, 272, 408]
     assert [profile["mid_target_count"] for profile in v15_profiles] == [32, 64, 96]
+    assert all(
+        abs(profile["keep_k"] - 0.8 * profile["scope_target_count"]) <= 0.5
+        for profile in v15_profiles
+    )
 
     config = LlavaConfig(
         vocab_size=64,

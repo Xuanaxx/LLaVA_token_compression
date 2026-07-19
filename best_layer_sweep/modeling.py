@@ -316,14 +316,14 @@ class LlavaBestLayerSweepForCausalLM(LlavaLlamaForCausalLM):
         use_cache: bool = False,
         output_attentions: bool = False,
         cache_position: Optional[torch.Tensor] = None,
+        position_embeddings=None,
     ):
         if attention_mask is not None:
             attention_mask = attention_mask.to(device=hidden_states.device)
         position_ids = position_ids.to(device=hidden_states.device)
         if cache_position is not None:
             cache_position = cache_position.to(device=hidden_states.device)
-        position_embeddings = None
-        if hasattr(self.model, "rotary_emb"):
+        if position_embeddings is None and hasattr(self.model, "rotary_emb"):
             try:
                 position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
             except TypeError:
@@ -382,13 +382,30 @@ class LlavaBestLayerSweepForCausalLM(LlavaLlamaForCausalLM):
         )
         if cache_position is None and position_ids is not None and position_ids.shape[0] == 1:
             cache_position = position_ids.squeeze(0)
-        causal_mask = None if hidden_states.shape[1] == 1 else self._prepare_mask(
-            attention_mask,
-            hidden_states,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
+        max_cache_shape = -1
+        if isinstance(past_key_values, Cache):
+            try:
+                max_cache_shape = int(past_key_values.get_max_cache_shape())
+            except (AttributeError, TypeError, ValueError):
+                max_cache_shape = -1
+        needs_explicit_mask = hidden_states.shape[1] != 1 or max_cache_shape > 0
+        causal_mask = (
+            self._prepare_mask(
+                attention_mask,
+                hidden_states,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+            )
+            if needs_explicit_mask
+            else None
         )
+        position_embeddings = None
+        if hasattr(self.model, "rotary_emb"):
+            try:
+                position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+            except TypeError:
+                position_embeddings = None
 
         for layer_idx, layer in enumerate(self.model.layers):
             if output_hidden_states:
@@ -406,6 +423,7 @@ class LlavaBestLayerSweepForCausalLM(LlavaLlamaForCausalLM):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
             )
             if use_cache and isinstance(next_cache, list):
                 next_cache.append(present)
@@ -505,6 +523,12 @@ class LlavaBestLayerSweepForCausalLM(LlavaLlamaForCausalLM):
             position_ids=position_ids,
             cache_position=cache_position,
         )
+        position_embeddings = None
+        if hasattr(self.model, "rotary_emb"):
+            try:
+                position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+            except TypeError:
+                position_embeddings = None
         for layer in self.model.layers[:scoring_layer_idx]:
             hidden_states, _, _ = self._run_layer(
                 layer,
@@ -514,6 +538,7 @@ class LlavaBestLayerSweepForCausalLM(LlavaLlamaForCausalLM):
                 use_cache=False,
                 output_attentions=False,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
             )
         return hidden_states
 
