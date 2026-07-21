@@ -7,7 +7,7 @@ fi
 source /data1/chenzixuan/uv_env/.tokencompression/bin/activate
 cd /data1/chenzixuan/open_source_projects/LLaVA_token_compression/learnable_pruner_lightweight
 
-GPU_IDS=${GPU_IDS:-0,2}
+GPU_IDS=${GPU_IDS:-1,2}
 IFS=',' read -r -a GPU_ID_ARRAY <<< "$GPU_IDS"
 declare -A GPU_ID_SEEN=()
 for index in "${!GPU_ID_ARRAY[@]}"; do
@@ -40,11 +40,10 @@ export LEARNABLE_PRUNE_BATCHED_SCORE_MAX_PADDING=${LEARNABLE_PRUNE_BATCHED_SCORE
 # Anyres batches fall back to row scoring when padding amplification is high;
 # keep their batched-path perturbation temporary conservative as well.
 export LEARNABLE_PRUNE_SCORE_TEMP_MIB=${LEARNABLE_PRUNE_SCORE_TEMP_MIB:-128}
-export WANDB_API_KEY="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"
 # Provide WANDB_API_KEY in the environment if needed.
 
 BATCH_SIZE=${BATCH_SIZE:-128}
-PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-16}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
 if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ || ! "$PER_DEVICE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "BATCH_SIZE and PER_DEVICE_BATCH_SIZE must be positive integers." >&2
   exit 2
@@ -64,6 +63,7 @@ MAX_STEPS=${MAX_STEPS:--1}
 MAX_SAMPLES=${MAX_SAMPLES:-}
 SAMPLE_RATE=${SAMPLE_RATE:-0.2}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
+SAVE_STEPS=${SAVE_STEPS:-250}
 BF16=${BF16:-true}
 FP16=${FP16:-false}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-8}
@@ -74,10 +74,25 @@ MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-0}
 echo "[launcher] GPU_IDS=$GPU_IDS NUM_GPUS=$NUM_GPUS gradient_accumulation=$GRADIENT_ACCUMULATION_STEPS"
 
 RANK_LOSS_WEIGHT=${RANK_LOSS_WEIGHT:-0.5}
-JS_LOSS_WEIGHT=${JS_LOSS_WEIGHT:-${KL_LOSS_WEIGHT:-6.0}}
+JS_LOSS_WEIGHT=${JS_LOSS_WEIGHT:-6.0}
 CE_LOSS_WEIGHT=${CE_LOSS_WEIGHT:-0.5}
 ENABLE_SCALE=${ENABLE_SCALE:-true}
 ENABLE_RSS=${ENABLE_RSS:-false}
+ENABLE_TRAINING_THREE_STAGE_PRUNE=${ENABLE_TRAINING_THREE_STAGE_PRUNE:-true}
+case "${ENABLE_TRAINING_THREE_STAGE_PRUNE,,}" in
+  1|true|yes|on)
+    ENABLE_TRAINING_THREE_STAGE_PRUNE=true
+    TRAINING_PRUNE_RUN_SUFFIX=""
+    ;;
+  0|false|no|off)
+    ENABLE_TRAINING_THREE_STAGE_PRUNE=false
+    TRAINING_PRUNE_RUN_SUFFIX="_training_topk_only"
+    ;;
+  *)
+    echo "ENABLE_TRAINING_THREE_STAGE_PRUNE must be true or false." >&2
+    exit 2
+    ;;
+esac
 
 # BUDGET_PROFILES is the sole pruning-budget source. One complete profile is
 # selected per microbatch by a balanced, deterministically shuffled cycle.
@@ -95,7 +110,7 @@ DATA_PATH=${DATA_PATH:-}
 IMAGE_FOLDER=${IMAGE_FOLDER:-}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/data1/chenzixuan/train_output"}
 TEACHER_LAYER=${TEACHER_LAYER:-16}
-RUN_NAME=${RUN_NAME:-"official_llava_next_7b_learnable_prune_lightweight_top80pctscope_multibudget160_320_640_layer${TEACHER_LAYER}_sample0.2"}
+RUN_NAME=${RUN_NAME:-"official_llava_next_7b_learnable_prune_lightweight_top80pctscope_multibudget160_320_640_layer${TEACHER_LAYER}_sample${SAMPLE_RATE}${TRAINING_PRUNE_RUN_SUFFIX}"}
 TEACHER_TARGET_LOG_DIR=${TEACHER_TARGET_LOG_DIR:-}
 TEACHER_TARGET_LOG_TO_CONSOLE=${TEACHER_TARGET_LOG_TO_CONSOLE:-false}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
@@ -163,6 +178,7 @@ accelerate launch "${ACCELERATE_ARGS[@]}" train_learnable_pruner.py \
   --ce_loss_weight "$CE_LOSS_WEIGHT" \
   --enable_scale "$ENABLE_SCALE" \
   --enable_rss "$ENABLE_RSS" \
+  --enable_training_three_stage_prune "$ENABLE_TRAINING_THREE_STAGE_PRUNE" \
   --topk_hinge_margin 1.0 \
   --kd_temperature 1.0 \
   --budgeted_soft_topk_iters 16 \
@@ -175,7 +191,7 @@ accelerate launch "${ACCELERATE_ARGS[@]}" train_learnable_pruner.py \
   --num_train_epochs 1 \
   --max_steps "$MAX_STEPS" \
   --logging_steps "$LOGGING_STEPS" \
-  --save_steps 500 \
+  --save_steps "$SAVE_STEPS" \
   --save_total_limit 4 \
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
   --dataloader_prefetch_factor "$DATALOADER_PREFETCH_FACTOR" \

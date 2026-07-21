@@ -75,6 +75,17 @@ def test_authoritative_budget_profiles_and_balanced_schedule():
         for profile in v15_profiles
     )
 
+    v15_13b_profiles = parse_budget_profiles(
+        "64:143:179:12:32:25;128:286:357:12:64:25;192:429:536:12:96:25"
+    )
+    assert v15_13b_profiles is not None
+    assert [profile["keep_k"] for profile in v15_13b_profiles] == [143, 286, 429]
+    assert [profile["scope_target_count"] for profile in v15_13b_profiles] == [179, 357, 536]
+    assert all(
+        abs(profile["keep_k"] - 0.8 * profile["scope_target_count"]) <= 0.5
+        for profile in v15_13b_profiles
+    )
+
     config = LlavaConfig(
         vocab_size=64,
         hidden_size=16,
@@ -222,7 +233,12 @@ def test_three_stage_forward_packs_tokens_and_keeps_predictor_gradient():
     visual_mask = input_ids.eq(IMAGE_TOKEN_INDEX) & attention_mask
     visual_positions, visual_valid = wrapper._pack_mask_positions(visual_mask)
     predictor_logits = torch.randn(2, visual_positions.shape[1], requires_grad=True)
-    retention_probs = wrapper._retention_probabilities(predictor_logits, visual_valid)
+    topk_indices, topk_selected_valid, hard_topk_mask = (
+        wrapper._predictor_topk_selection(predictor_logits, visual_valid)
+    )
+    retention_probs = wrapper._retention_probabilities(
+        predictor_logits, visual_valid, hard_topk_mask
+    )
     exact_one_gate = torch.ones_like(retention_probs) + (
         retention_probs - retention_probs.detach()
     )
@@ -235,8 +251,9 @@ def test_three_stage_forward_packs_tokens_and_keeps_predictor_gradient():
             attention_mask=attention_mask,
             position_ids=position_ids,
             labels=labels,
-            predictor_logits=predictor_logits,
             retention_probs=retention_probs,
+            topk_indices=topk_indices,
+            topk_selected_valid=topk_selected_valid,
             visual_positions=visual_positions,
             visual_valid=visual_valid,
         )
@@ -245,6 +262,93 @@ def test_three_stage_forward_packs_tokens_and_keeps_predictor_gradient():
     assert stats["mid_visual_tokens"].item() == 2.0
     assert stats["final_visual_tokens"].item() == 0.0
     assert final_attention.sum(dim=-1).tolist() == [4, 4]
+    answer_mask = final_attention[:, :-1] & final_labels[:, 1:].ne(IGNORE_INDEX)
+    hidden[:, :-1][answer_mask].square().mean().backward()
+
+    assert torch.all(predictor_logits.grad[visual_valid].ne(0))
+    assert all(parameter.grad is None for parameter in llava.parameters())
+
+
+def test_topk_only_forward_prunes_directly_and_keeps_predictor_gradient():
+    torch.manual_seed(5)
+    config = LlavaConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        pad_token_id=0,
+    )
+    config._attn_implementation = "sdpa"
+    llava = LlavaLlamaForCausalLM(config)
+    wrapper = LearnablePruneWrapper(
+        llava,
+        LearnablePrunePredictor(
+            input_size=32,
+            hidden_size=16,
+            rank=8,
+            num_heads=1,
+        ),
+        budget_profiles=[
+            {
+                "avg_token_budget": 2,
+                "keep_k": 2,
+                "scope_target_count": 5,
+                "mid_pruning_layer_idx": 1,
+                "mid_target_count": 2,
+                "final_wipe_layer_idx": 3,
+                "enable_final_wipe": True,
+            }
+        ],
+        teacher_layer=2,
+        enable_training_three_stage_prune=False,
+    )
+    wrapper.gradient_checkpointing_enable()
+
+    input_ids = torch.tensor(
+        [
+            [5, -200, -200, -200, -200, -200, -200, 6, 7, 8],
+            [9, -200, -200, -200, -200, 10, 11, 12, 0, 0],
+        ]
+    )
+    attention_mask = input_ids.ne(0)
+    position_ids = torch.arange(input_ids.shape[1])[None].repeat(2, 1)
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    labels[0, -2:] = torch.tensor([20, 21])
+    labels[1, 6:8] = torch.tensor([22, 23])
+    inputs_embeds = torch.randn(2, input_ids.shape[1], config.hidden_size)
+    visual_mask = input_ids.eq(IMAGE_TOKEN_INDEX) & attention_mask
+    visual_positions, visual_valid = wrapper._pack_mask_positions(visual_mask)
+    predictor_logits = torch.randn(2, visual_positions.shape[1], requires_grad=True)
+    _, _, hard_topk_mask = wrapper._predictor_topk_selection(
+        predictor_logits, visual_valid
+    )
+    retention_probs = wrapper._retention_probabilities(
+        predictor_logits, visual_valid, hard_topk_mask
+    )
+
+    with wrapper._temporary_decoder_checkpoint_training():
+        hidden, final_attention, final_labels, stats = wrapper._topk_student_forward(
+            inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            labels=labels,
+            retention_probs=retention_probs,
+            hard_topk_mask=hard_topk_mask,
+            visual_positions=visual_positions,
+            visual_valid=visual_valid,
+        )
+
+    assert wrapper.enable_training_three_stage_prune is False
+    assert stats["scope_visual_tokens"].item() == 2.0
+    assert stats["mid_visual_tokens"].item() == 2.0
+    assert stats["final_visual_tokens"].item() == 2.0
+    assert stats["avg_visual_tokens_budget"].item() == 2.0
+    assert final_attention.sum(dim=-1).tolist() == [6, 6]
     answer_mask = final_attention[:, :-1] & final_labels[:, 1:].ne(IGNORE_INDEX)
     hidden[:, :-1][answer_mask].square().mean().backward()
 
@@ -300,15 +404,21 @@ def test_js_and_ce_independently_reach_every_valid_predictor_logit():
     predictor_logits = torch.randn(
         2, visual_positions.shape[1], requires_grad=True
     )
-    retention = wrapper._retention_probabilities(predictor_logits, visual_valid)
+    topk_indices, topk_selected_valid, hard_topk_mask = (
+        wrapper._predictor_topk_selection(predictor_logits, visual_valid)
+    )
+    retention = wrapper._retention_probabilities(
+        predictor_logits, visual_valid, hard_topk_mask
+    )
     hidden, student_attention, student_labels, _ = wrapper._three_stage_student_forward(
         inputs_embeds=embeddings,
         input_ids=input_ids,
         attention_mask=attention,
         position_ids=positions,
         labels=labels,
-        predictor_logits=predictor_logits,
         retention_probs=retention,
+        topk_indices=topk_indices,
+        topk_selected_valid=topk_selected_valid,
         visual_positions=visual_positions,
         visual_valid=visual_valid,
     )
@@ -673,6 +783,7 @@ if __name__ == "__main__":
     test_predictor_budget_topk_handles_packed_rows()
     test_distributed_cuda_preflight_rejects_rank_gpu_aliasing()
     test_three_stage_forward_packs_tokens_and_keeps_predictor_gradient()
+    test_topk_only_forward_prunes_directly_and_keeps_predictor_gradient()
     test_js_and_ce_independently_reach_every_valid_predictor_logit()
     test_vectorized_ragged_pack_matches_row_reference()
     test_batched_teacher_scoring_matches_ragged_fallback()

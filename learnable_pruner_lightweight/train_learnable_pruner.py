@@ -15,9 +15,11 @@ not run the dynamic candidate-layer search used by the original trainer.
 By default the student branch mirrors inference in one segmented decoder pass:
 predictor TopK seeds are expanded by SeededResidualSCOPE before layer 0, visual
 tokens are pruned again from mid-layer attention importance, and all remaining
-visual tokens are removed at the final-wipe layer.  Physical packing keeps the
-student activations small.  A fixed-budget straight-through gate on the retained
-visual embeddings supplies an end-to-end surrogate gradient to the predictor.
+visual tokens are removed at the final-wipe layer.  For an ablation,
+``--enable_training_three_stage_prune false`` instead directly packs only the
+predictor TopK visual tokens and runs the full decoder without SCOPE, mid-stage,
+or final-wipe pruning.  Both modes use a fixed-budget straight-through gate to
+keep JS/CE gradients connected to the predictor.
 
 Multiple deployment budgets can share one predictor: a deterministic shuffled
 cycle activates one complete pruning profile per microbatch on every DDP rank.
@@ -644,7 +646,7 @@ class _BudgetedSigmoidTopK(torch.autograd.Function):
         lo = torch.where(free_rows, lo, torch.zeros_like(lo))
         hi = torch.where(free_rows, hi, torch.zeros_like(hi))
         target_float = target.to(dtype=x.dtype)
-        for _ in range(max(8, max_iter)):
+        for _ in range(max_iter):
             mid = (lo + hi) * 0.5
             mass = (torch.sigmoid((x - mid[:, None]) / temperature) * valid).sum(dim=-1)
             # mass decreases as lambda increases.
@@ -689,6 +691,7 @@ class LearnablePruneWrapper(nn.Module):
         ce_loss_weight: float = 1.0,
         enable_scale: bool = True,
         enable_rss: bool = False,
+        enable_training_three_stage_prune: bool = True,
         topk_hinge_margin: float = 1.0,
         kd_temperature: float = 1.0,
         budgeted_soft_topk_iters: int = 32,
@@ -705,6 +708,7 @@ class LearnablePruneWrapper(nn.Module):
         self.ce_loss_weight = float(ce_loss_weight)
         self.enable_scale = bool(enable_scale)
         self.enable_rss = bool(enable_rss)
+        self.enable_training_three_stage_prune = bool(enable_training_three_stage_prune)
         self.topk_hinge_margin = float(topk_hinge_margin)
         self.kd_temperature = float(kd_temperature)
         self.budgeted_soft_topk_iters = int(budgeted_soft_topk_iters)
@@ -736,8 +740,8 @@ class LearnablePruneWrapper(nn.Module):
 
         if self.topk_hinge_margin <= 0.0:
             raise ValueError("topk_hinge_margin must be positive")
-        if self.budgeted_soft_topk_iters <= 0:
-            raise ValueError("budgeted_soft_topk_iters must be positive")
+        if self.budgeted_soft_topk_iters < 8:
+            raise ValueError("budgeted_soft_topk_iters must be at least 8")
         num_layers = len(getattr(self.llava.model, "layers", []))
         self._decoder_layer_forward_parameters = (
             set(inspect.signature(self.llava.model.layers[0].forward).parameters)
@@ -1265,7 +1269,8 @@ class LearnablePruneWrapper(nn.Module):
         valid = torch.arange(max_count, device=mask.device)[None, :] < counts[:, None]
         if max_count:
             batch_idx, seq_idx = mask.nonzero(as_tuple=True)
-            slot_idx = mask.long().cumsum(dim=-1)[batch_idx, seq_idx] - 1
+            row_offsets = counts.cumsum(dim=0) - counts
+            slot_idx = torch.arange(seq_idx.numel(), device=seq_idx.device) - row_offsets[batch_idx]
             positions[batch_idx, slot_idx] = seq_idx
         return positions, valid
 
@@ -1615,12 +1620,29 @@ class LearnablePruneWrapper(nn.Module):
             int(self.budgeted_soft_topk_iters),
         )
 
+    @torch.no_grad()
+    def _predictor_topk_selection(
+        self,
+        predictor_logits: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the active hard TopK indices and mask once per microbatch."""
+
+        indices, selected_valid = self.predictor.budget_topk_indices(
+            predictor_logits.detach(), self.keep_k, visual_valid
+        )
+        hard_mask = torch.zeros_like(visual_valid, dtype=torch.bool)
+        if indices.shape[1] > 0:
+            hard_mask.scatter_(dim=-1, index=indices, src=selected_valid)
+        return indices, selected_valid, hard_mask
+
     def _retention_probabilities(
         self,
         predictor_logits: torch.Tensor,
         visual_valid: torch.Tensor,
+        hard_topk_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Return hard-ST visual retention gates for physical three-stage pruning."""
+        """Return hard-ST visual retention gates for physical student pruning."""
         valid = visual_valid.bool()
         soft = self._budgeted_soft_topk_gate(predictor_logits, valid)
         valid_counts = valid.sum(dim=-1)
@@ -1629,9 +1651,12 @@ class LearnablePruneWrapper(nn.Module):
             soft.detach().float().sum(dim=-1) - keep_counts.float()
         ).abs().mean()
 
-        hard = self.predictor.budget_topk_mask(
-            predictor_logits, self.keep_k, valid
-        ).to(dtype=predictor_logits.dtype)
+        if hard_topk_mask.shape != valid.shape:
+            raise ValueError(
+                f"hard_topk_mask must match visual_valid shape {tuple(valid.shape)}, "
+                f"got {tuple(hard_topk_mask.shape)}"
+            )
+        hard = (hard_topk_mask.bool() & valid).to(dtype=predictor_logits.dtype)
         gate = hard + soft - soft.detach()
         return torch.where(valid, gate, torch.ones_like(gate))
 
@@ -1651,7 +1676,7 @@ class LearnablePruneWrapper(nn.Module):
         min_count, max_count = torch.aminmax(counts)
         min_count_host, max_count_host = torch.stack((min_count, max_count)).to(device="cpu").tolist()
         if min_count_host == 0:
-            raise ValueError("Three-stage pruning cannot remove every token from a sequence.")
+            raise ValueError("Student pruning cannot remove every token from a sequence.")
         max_count_host = int(max_count_host)
 
         batch_idx, seq_idx = keep_mask.nonzero(as_tuple=True)
@@ -1677,6 +1702,39 @@ class LearnablePruneWrapper(nn.Module):
         packed_labels.masked_fill_(~packed_attention, IGNORE_INDEX)
         packed_attention = packed_attention.to(dtype=attention_mask.dtype)
         return packed_hidden, packed_ids, packed_attention, packed_positions, packed_labels
+
+    def _pack_initial_student_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        keep_mask: torch.Tensor,
+        retention_probs: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the shared TopK straight-through gate and physically pack inputs."""
+
+        # Forward values stay exactly one for retained visual embeddings. Their
+        # derivatives follow the fixed-budget relaxation, preserving a gradient
+        # path to all logits while the hard keep mask controls physical packing.
+        visual_st_gate = torch.ones_like(retention_probs) + (
+            retention_probs - retention_probs.detach()
+        )
+        sequence_gate = inputs_embeds.new_ones(attention_mask.shape)
+        visual_mask = input_ids.eq(int(IMAGE_TOKEN_INDEX)) & attention_mask.bool()
+        sequence_gate[visual_mask] = visual_st_gate[visual_valid].to(
+            dtype=sequence_gate.dtype
+        )
+        return self._pack_by_keep_mask(
+            inputs_embeds * sequence_gate.unsqueeze(-1),
+            input_ids,
+            attention_mask,
+            position_ids,
+            labels,
+            keep_mask,
+        )
 
     def _run_decoder_layer_range(
         self,
@@ -1722,7 +1780,8 @@ class LearnablePruneWrapper(nn.Module):
         inputs_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        predictor_logits: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_selected_valid: torch.Tensor,
         visual_positions: torch.Tensor,
         visual_valid: torch.Tensor,
     ) -> torch.Tensor:
@@ -1731,15 +1790,13 @@ class LearnablePruneWrapper(nn.Module):
         keep_mask = attention_mask.bool() & input_ids.ne(int(IMAGE_TOKEN_INDEX))
         visual_counts = visual_valid.sum(dim=-1).to(device="cpu", dtype=torch.long).tolist()
         with torch.no_grad():
-            detached_logits = predictor_logits.detach().float()
-            seed_indices, seed_valid = self.predictor.budget_topk_indices(
-                detached_logits, self.keep_k, visual_valid
-            )
             for batch_idx, visual_count in enumerate(visual_counts):
                 if visual_count <= 0:
                     continue
                 row_positions = visual_positions[batch_idx, :visual_count]
-                seeds = seed_indices[batch_idx, seed_valid[batch_idx]]
+                seeds = topk_indices[
+                    batch_idx, topk_selected_valid[batch_idx]
+                ]
                 target_count = min(self.scope_target_count, visual_count)
                 selected_relative = _seeded_residual_scope_indices(
                     inputs_embeds[batch_idx].index_select(0, row_positions),
@@ -1846,8 +1903,9 @@ class LearnablePruneWrapper(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         labels: torch.Tensor,
-        predictor_logits: torch.Tensor,
         retention_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_selected_valid: torch.Tensor,
         visual_positions: torch.Tensor,
         visual_valid: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
@@ -1857,27 +1915,22 @@ class LearnablePruneWrapper(nn.Module):
             inputs_embeds,
             input_ids,
             attention_mask,
-            predictor_logits,
+            topk_indices,
+            topk_selected_valid,
             visual_positions,
             visual_valid,
         )
-        # Forward value is exactly one for every visual token.  Its derivative is
-        # the fixed-budget soft TopK derivative, so hard physical packing remains
-        # inference-faithful while JS/CE still optimize the predictor end to end.
-        visual_st_gate = torch.ones_like(retention_probs) + (
-            retention_probs - retention_probs.detach()
-        )
-        sequence_gate = inputs_embeds.new_ones(attention_mask.shape)
-        visual_mask = input_ids.eq(int(IMAGE_TOKEN_INDEX)) & attention_mask.bool()
-        sequence_gate[visual_mask] = visual_st_gate[visual_valid].to(dtype=sequence_gate.dtype)
-        gated_inputs = inputs_embeds * sequence_gate.unsqueeze(-1)
-        hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = self._pack_by_keep_mask(
-            gated_inputs,
-            input_ids,
-            attention_mask,
-            position_ids,
-            labels,
-            scope_keep_mask,
+        hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = (
+            self._pack_initial_student_inputs(
+                inputs_embeds,
+                input_ids,
+                attention_mask,
+                position_ids,
+                labels,
+                scope_keep_mask,
+                retention_probs,
+                visual_valid,
+            )
         )
         scope_visual_counts = (
             stage_ids.eq(int(IMAGE_TOKEN_INDEX)) & stage_attention.bool()
@@ -1953,14 +2006,76 @@ class LearnablePruneWrapper(nn.Module):
         }
         return hidden_states, stage_attention, stage_labels, stats
 
-    def _selector_loss(
+    def _topk_student_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        retention_probs: torch.Tensor,
+        hard_topk_mask: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Directly prune to predictor TopK, then run the complete decoder."""
+
+        keep_mask = attention_mask.bool() & input_ids.ne(int(IMAGE_TOKEN_INDEX))
+        selected_visual = visual_valid & hard_topk_mask.bool()
+        selected_batch = torch.arange(
+            input_ids.shape[0], device=input_ids.device
+        )[:, None].expand_as(visual_positions)
+        keep_mask[
+            selected_batch[selected_visual], visual_positions[selected_visual]
+        ] = True
+
+        hidden_states, stage_ids, stage_attention, stage_positions, stage_labels = (
+            self._pack_initial_student_inputs(
+                inputs_embeds,
+                input_ids,
+                attention_mask,
+                position_ids,
+                labels,
+                keep_mask,
+                retention_probs,
+                visual_valid,
+            )
+        )
+        hidden_states = self._run_decoder_layer_range(
+            hidden_states,
+            stage_attention,
+            stage_positions,
+            0,
+            len(self.llava.model.layers),
+        )
+        hidden_states = self.llava.model.norm(hidden_states)
+
+        topk_visual_counts = (
+            stage_ids.eq(int(IMAGE_TOKEN_INDEX)) & stage_attention.bool()
+        ).sum(dim=-1).float()
+        stats = {
+            # Keep the established metric schema so logging and dashboards work
+            # for both ablation modes; all three values equal the sole TopK stage.
+            "scope_visual_tokens": topk_visual_counts.mean(),
+            "mid_visual_tokens": topk_visual_counts.mean(),
+            "final_visual_tokens": topk_visual_counts.mean(),
+            "avg_visual_tokens_budget": topk_visual_counts.mean(),
+            "student_sequence_tokens": stage_attention.sum(dim=-1).float().mean(),
+        }
+        return hidden_states, stage_attention, stage_labels, stats
+
+    def _selector_losses_by_keep_k(
         self,
         predictor_logits: torch.Tensor,
         teacher_scores: torch.Tensor,
         teacher_valid: torch.Tensor,
-        keep_k: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        keep_k = self.keep_k if keep_k is None else int(keep_k)
+        keep_ks: List[int],
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Compute multi-budget selector losses from one shared score ordering."""
+
+        keep_ks = sorted({int(keep_k) for keep_k in keep_ks})
+        if not keep_ks or keep_ks[0] < 0:
+            raise ValueError(f"keep_ks must contain non-negative budgets, got: {keep_ks}")
         valid = teacher_valid.bool()
         counts = valid.sum(dim=-1)
         metric_rows = counts > 1
@@ -1970,6 +2085,9 @@ class LearnablePruneWrapper(nn.Module):
         pos_inf = torch.tensor(torch.inf, device=pred.device, dtype=pred.dtype)
         neg_inf = torch.tensor(-torch.inf, device=pred.device, dtype=pred.dtype)
 
+        # Spearman is budget-independent. Compute its two rank transforms once
+        # instead of repeating them for every configured TopK. Budget-specific
+        # torch.topk calls remain unchanged to preserve exact tie behavior.
         teacher_ranks = torch.argsort(
             torch.argsort(teacher.masked_fill(~valid, pos_inf), dim=-1), dim=-1
         ).float()
@@ -1985,37 +2103,72 @@ class LearnablePruneWrapper(nn.Module):
         ).clamp_min(1e-6)
         selector_spearman = (spearman_per_row * metric_rows).sum() / metric_denom
 
-        topk_count = min(keep_k, pred.shape[1])
-        if topk_count == 0:
-            zero = pred.sum() * 0.0
-            return zero, selector_spearman, zero, zero
-        teacher_top_idx = torch.topk(teacher.masked_fill(~valid, neg_inf), k=topk_count, dim=-1).indices
-        pred_top_idx = torch.topk(pred.masked_fill(~valid, neg_inf), k=topk_count, dim=-1).indices
-        teacher_top = torch.zeros_like(valid).scatter(1, teacher_top_idx, True) & valid
-        pred_top = torch.zeros_like(valid).scatter(1, pred_top_idx, True) & valid
-        keep_counts = counts.clamp(max=keep_k).clamp_min(1)
-        overlap_per_row = (teacher_top & pred_top).sum(dim=-1).float() / keep_counts.float()
-        selector_topk_overlap = (overlap_per_row * metric_rows).sum() / metric_denom
+        results: Dict[
+            int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        for keep_k in keep_ks:
+            topk_count = min(keep_k, pred.shape[1])
+            if topk_count == 0:
+                zero = pred.sum() * 0.0
+                results[keep_k] = (zero, selector_spearman, zero, zero)
+                continue
+            teacher_top_idx = torch.topk(
+                teacher.masked_fill(~valid, neg_inf), k=topk_count, dim=-1
+            ).indices
+            pred_top_idx = torch.topk(
+                pred.masked_fill(~valid, neg_inf), k=topk_count, dim=-1
+            ).indices
+            teacher_top = torch.zeros_like(valid).scatter(1, teacher_top_idx, True) & valid
+            pred_top = torch.zeros_like(valid).scatter(1, pred_top_idx, True) & valid
+            keep_counts = counts.clamp(max=keep_k).clamp_min(1)
+            overlap_per_row = (
+                (teacher_top & pred_top).sum(dim=-1).float() / keep_counts.float()
+            )
+            selector_topk_overlap = (overlap_per_row * metric_rows).sum() / metric_denom
 
-        boundary_rows = counts > keep_k
-        boundary_denom = boundary_rows.sum().clamp_min(1).float()
-        negatives = valid & ~teacher_top
-        margin_scores = (pred + self.topk_hinge_margin * negatives).masked_fill(~valid, neg_inf)
-        violating = torch.topk(margin_scores, k=topk_count, dim=-1).values.sum(dim=-1)
-        positive = pred.gather(1, teacher_top_idx).sum(dim=-1)
-        row_rank_loss = ((violating - positive) / float(topk_count)).clamp_min(0.0)
-        rank_loss = (row_rank_loss * boundary_rows).sum() / metric_denom
+            boundary_rows = counts > keep_k
+            boundary_denom = boundary_rows.sum().clamp_min(1).float()
+            negatives = valid & ~teacher_top
+            margin_scores = (pred + self.topk_hinge_margin * negatives).masked_fill(
+                ~valid, neg_inf
+            )
+            violating = torch.topk(
+                margin_scores, k=topk_count, dim=-1
+            ).values.sum(dim=-1)
+            positive = pred.gather(1, teacher_top_idx).sum(dim=-1)
+            row_rank_loss = (
+                (violating - positive) / float(topk_count)
+            ).clamp_min(0.0)
+            rank_loss = (row_rank_loss * boundary_rows).sum() / metric_denom
 
-        hard_neg_idx = torch.topk(pred.masked_fill(~negatives, neg_inf), k=topk_count, dim=-1).indices
-        pos_logits = pred.gather(1, teacher_top_idx)
-        neg_logits = pred.gather(1, hard_neg_idx)
-        neg_counts = (counts - keep_k).clamp(min=0, max=topk_count)
-        neg_slots = torch.arange(topk_count, device=pred.device)[None, :] < neg_counts[:, None]
-        comparisons = (pos_logits[:, :, None] > neg_logits[:, None, :]) & neg_slots[:, None, :]
-        comparison_count = (topk_count * neg_counts).clamp_min(1).float()
-        boundary_per_row = comparisons.sum(dim=(1, 2)).float() / comparison_count
-        selector_boundary_accuracy = (boundary_per_row * boundary_rows).sum() / boundary_denom
-        return rank_loss, selector_spearman, selector_topk_overlap, selector_boundary_accuracy
+            hard_neg_idx = torch.topk(
+                pred.masked_fill(~negatives, neg_inf), k=topk_count, dim=-1
+            ).indices
+            pos_logits = pred.gather(1, teacher_top_idx)
+            neg_logits = pred.gather(1, hard_neg_idx)
+            neg_counts = (counts - keep_k).clamp(min=0, max=topk_count)
+            neg_slots = (
+                torch.arange(topk_count, device=pred.device)[None, :]
+                < neg_counts[:, None]
+            )
+            comparisons = (
+                (pos_logits[:, :, None] > neg_logits[:, None, :])
+                & neg_slots[:, None, :]
+            )
+            comparison_count = (topk_count * neg_counts).clamp_min(1).float()
+            boundary_per_row = (
+                comparisons.sum(dim=(1, 2)).float() / comparison_count
+            )
+            selector_boundary_accuracy = (
+                (boundary_per_row * boundary_rows).sum() / boundary_denom
+            )
+            results[keep_k] = (
+                rank_loss,
+                selector_spearman,
+                selector_topk_overlap,
+                selector_boundary_accuracy,
+            )
+        return results
 
     def _answer_token_mask(
         self,
@@ -2191,16 +2344,18 @@ class LearnablePruneWrapper(nn.Module):
             visual_coordinates=expanded_visual_coordinates,
         )
 
-        retention_probs = self._retention_probabilities(predictor_logits, visual_valid)
-        selector_by_keep_k = {
-            keep_k: self._selector_loss(
-                predictor_logits=predictor_logits,
-                teacher_scores=teacher_scores,
-                teacher_valid=teacher_valid,
-                keep_k=keep_k,
-            )
-            for keep_k in sorted({int(profile["keep_k"]) for profile in self.budget_profiles})
-        }
+        topk_indices, topk_selected_valid, hard_topk_mask = (
+            self._predictor_topk_selection(predictor_logits, visual_valid)
+        )
+        retention_probs = self._retention_probabilities(
+            predictor_logits, visual_valid, hard_topk_mask
+        )
+        selector_by_keep_k = self._selector_losses_by_keep_k(
+            predictor_logits=predictor_logits,
+            teacher_scores=teacher_scores,
+            teacher_valid=teacher_valid,
+            keep_ks=[int(profile["keep_k"]) for profile in self.budget_profiles],
+        )
         (
             _active_rank_loss,
             selector_spearman,
@@ -2212,22 +2367,41 @@ class LearnablePruneWrapper(nn.Module):
         rank_loss = torch.stack([values[0] for values in selector_by_keep_k.values()]).mean()
 
         with self._temporary_decoder_checkpoint_training():
-            (
-                pruned_hidden_states,
-                student_attention_mask,
-                student_labels,
-                stage_stats,
-            ) = self._three_stage_student_forward(
-                inputs_embeds=inputs_embeds,
-                input_ids=expanded_input_ids,
-                attention_mask=expanded_attention_mask,
-                position_ids=original_position_ids,
-                labels=expanded_labels,
-                predictor_logits=predictor_logits,
-                retention_probs=retention_probs,
-                visual_positions=visual_positions,
-                visual_valid=visual_valid,
-            )
+            if self.enable_training_three_stage_prune:
+                (
+                    pruned_hidden_states,
+                    student_attention_mask,
+                    student_labels,
+                    stage_stats,
+                ) = self._three_stage_student_forward(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=expanded_input_ids,
+                    attention_mask=expanded_attention_mask,
+                    position_ids=original_position_ids,
+                    labels=expanded_labels,
+                    retention_probs=retention_probs,
+                    topk_indices=topk_indices,
+                    topk_selected_valid=topk_selected_valid,
+                    visual_positions=visual_positions,
+                    visual_valid=visual_valid,
+                )
+            else:
+                (
+                    pruned_hidden_states,
+                    student_attention_mask,
+                    student_labels,
+                    stage_stats,
+                ) = self._topk_student_forward(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=expanded_input_ids,
+                    attention_mask=expanded_attention_mask,
+                    position_ids=original_position_ids,
+                    labels=expanded_labels,
+                    retention_probs=retention_probs,
+                    hard_topk_mask=hard_topk_mask,
+                    visual_positions=visual_positions,
+                    visual_valid=visual_valid,
+                )
         js_loss, ce_loss = self._js_ce_losses(
             teacher_logits,
             pruned_hidden_states,
@@ -2462,8 +2636,16 @@ class LearnablePruneTrainer(Trainer):
             model = model.module
         torch.save(model.predictor.state_dict(), os.path.join(output_dir, "predictor.pt"))
         default_profile = model.budget_profiles[0]
+        training_pruning_mode = (
+            "three_stage" if model.enable_training_three_stage_prune else "predictor_topk_only"
+        )
+        training_variant = (
+            "three_stage_scope_mid_finalwipe_fixed_layer_js_packed_hard_st"
+            if model.enable_training_three_stage_prune
+            else "predictor_topk_only_fixed_layer_js_packed_hard_st"
+        )
         config = {
-            "training_variant": "three_stage_scope_mid_finalwipe_fixed_layer_js_packed_hard_st"
+            "training_variant": training_variant
             + ("_multibudget" if len(model.budget_profiles) > 1 else "")
             + "_tclm_multihead_rank_swiglu",
             "keep_k": int(default_profile["keep_k"]),
@@ -2473,13 +2655,14 @@ class LearnablePruneTrainer(Trainer):
             "ce_loss_weight": model.ce_loss_weight,
             "enable_scale": model.enable_scale,
             "enable_rss": model.enable_rss,
+            "enable_training_three_stage_prune": model.enable_training_three_stage_prune,
             "topk_hinge_margin": model.topk_hinge_margin,
             "teacher_layer_quality": "fixed_layer",
             "teacher_layer_pooling": "fixed_single_layer",
             "kd_temperature": model.kd_temperature,
             "attention_gate_mode": "packed_embedding_hard_st",
             "budgeted_soft_topk_iters": model.budgeted_soft_topk_iters,
-            "training_pruning_mode": "three_stage",
+            "training_pruning_mode": training_pruning_mode,
             "scope_target_count": int(default_profile["scope_target_count"]),
             "mid_pruning_layer_idx": int(default_profile["mid_pruning_layer_idx"]),
             "mid_target_count": int(default_profile["mid_target_count"]),
@@ -2493,7 +2676,11 @@ class LearnablePruneTrainer(Trainer):
             "teacher_target_logging": model._teacher_target_logger is not None or model.teacher_target_log_to_console,
             "predictor_input_context": "pre_llm_visual_tokens_plus_unlabeled_prompt_tokens",
             "distillation_loss": "jensen_shannon_full_vocabulary",
-            "distillation_mask_type": "physical_scope_mid_finalwipe_with_packed_embedding_st",
+            "distillation_mask_type": (
+                "physical_scope_mid_finalwipe_with_packed_embedding_st"
+                if model.enable_training_three_stage_prune
+                else "physical_predictor_topk_with_packed_embedding_st"
+            ),
             "predictor_input_size": model.predictor.input_size,
             "predictor_hidden_size": model.predictor.hidden_size,
             "predictor_rank": getattr(model.predictor, "rank", None),
@@ -2531,17 +2718,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor_use_text_position", type=parse_bool_flag, default=True)
 
     parser.add_argument("--rank_loss_weight", type=float, default=0.5)
-    parser.add_argument(
-        "--js_loss_weight",
-        "--kl_loss_weight",
-        dest="js_loss_weight",
-        type=float,
-        default=6.0,
-        help="JS-divergence loss weight. --kl_loss_weight remains a deprecated compatibility alias.",
-    )
+    parser.add_argument("--js_loss_weight", type=float, default=6.0)
     parser.add_argument("--ce_loss_weight", type=float, default=0.5)
     parser.add_argument("--enable_scale", type=parse_bool_flag, default=True)
     parser.add_argument("--enable_rss", type=parse_bool_flag, default=False)
+    parser.add_argument(
+        "--enable_training_three_stage_prune",
+        type=parse_bool_flag,
+        default=True,
+        help=(
+            "Whether the training student uses SCOPE, mid-stage, and final-wipe pruning. "
+            "When false, it directly keeps predictor TopK visual tokens and runs the full decoder."
+        ),
+    )
     parser.add_argument("--topk_hinge_margin", type=float, default=1.0)
     parser.add_argument("--kd_temperature", type=float, default=1.0)
     parser.add_argument("--budgeted_soft_topk_iters", type=int, default=16)
@@ -2569,7 +2758,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--save_steps", type=int, default=250)
     parser.add_argument("--save_total_limit", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=8)
     parser.add_argument("--dataloader_prefetch_factor", type=int, default=4)
@@ -2672,6 +2861,7 @@ def main() -> None:
         ce_loss_weight=args.ce_loss_weight,
         enable_scale=args.enable_scale,
         enable_rss=args.enable_rss,
+        enable_training_three_stage_prune=args.enable_training_three_stage_prune,
         topk_hinge_margin=args.topk_hinge_margin,
         kd_temperature=args.kd_temperature,
         budgeted_soft_topk_iters=args.budgeted_soft_topk_iters,
