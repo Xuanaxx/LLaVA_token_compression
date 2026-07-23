@@ -74,6 +74,11 @@ def _enable_predictor() -> bool:
     return _env_flag("ENABLE_PREDICTOR", ENABLE_PREDICTOR)
 
 
+def _predictor_only() -> bool:
+    """Select predictor TopK once, then keep those visual tokens through every layer."""
+    return _env_flag("LEARNABLE_PRUNE_PREDICTOR_ONLY", False)
+
+
 def _mid_target_count(default: Optional[int] = None) -> int:
     base = MID_TARGET_COUNT if default is None else int(default)
     return _env_int("MID_TARGET_COUNT", base)
@@ -705,6 +710,9 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if input_ids.shape[0] != 1:
             raise ValueError("learnable-prune scope-finalwipe generation currently expects batch_size=1")
         enable_predictor = _enable_predictor()
+        predictor_only = _predictor_only()
+        if predictor_only and not enable_predictor:
+            raise ValueError("LEARNABLE_PRUNE_PREDICTOR_ONLY=1 requires ENABLE_PREDICTOR=1")
         if enable_predictor:
             self._ensure_learnable_prune_loaded()
         elif not hasattr(self, "learnable_prune_stats"):
@@ -761,11 +769,18 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         if predictor_end is not None:
             predictor_end.record()
 
-        target_keep = min(
-            _scope_target_count(getattr(self, "learnable_prune_scope_target_count", SCOPE_TARGET_COUNT)),
-            int(visual_positions.numel()),
-        )
-        if target_keep > topk:
+        if predictor_only:
+            # The ablation applies the predictor budget directly: there is no
+            # SCOPE diversity fill, even when the checkpoint's saved scope
+            # target is larger than the requested TopK.
+            target_keep = topk
+            visual_keep_relative = top_relative.sort().values
+        else:
+            target_keep = min(
+                _scope_target_count(getattr(self, "learnable_prune_scope_target_count", SCOPE_TARGET_COUNT)),
+                int(visual_positions.numel()),
+            )
+        if not predictor_only and target_keep > topk:
             visual_source = predictor_inputs if enable_predictor else inputs_embeds
             visual_embeds = visual_source.index_select(1, visual_positions)
             seeded_scope_rank, _ = SeededResidualSCOPE(
@@ -775,15 +790,16 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 spatial_bonus=0.0,
             )
             visual_keep_relative = seeded_scope_rank[0]
-        else:
+        elif not predictor_only:
             visual_keep_relative = top_relative[:target_keep].sort().values
         if scope_end is not None:
             scope_end.record()
             torch.cuda.synchronize(inputs_embeds.device)
+            selection_label = "topk_pack" if predictor_only else "scope_fill"
             print(
                 "[learnable_prune_scope_profile] "
                 f"predictor={predictor_start.elapsed_time(predictor_end):.3f}ms "
-                f"scope_fill={predictor_end.elapsed_time(scope_end):.3f}ms",
+                f"{selection_label}={predictor_end.elapsed_time(scope_end):.3f}ms",
                 flush=True,
             )
 
@@ -803,13 +819,18 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 "enable_predictor": bool(enable_predictor),
                 "learnable_topk_visual_tokens": int(topk),
                 "kept_visual_tokens": int(visual_keep.numel()),
-                "scope_target_visual_tokens": int(target_keep),
+                "initial_target_visual_tokens": int(target_keep),
+                "scope_target_visual_tokens": 0 if predictor_only else int(target_keep),
+                "predictor_only": bool(predictor_only),
+                "scope_enabled": not predictor_only,
                 "avg_token_budget_profile": int(
                     getattr(self, "learnable_prune_active_budget_profile", {}).get(
                         "avg_token_budget", -1
                     )
                 ),
-                "diversity_fill_method": "seeded_residual_scope",
+                "diversity_fill_method": (
+                    "none_predictor_topk_only" if predictor_only else "seeded_residual_scope"
+                ),
                 "pruned_tokens": int(input_ids.shape[1] - keep_positions.numel()),
                 "checkpoint": getattr(self, "learnable_prune_checkpoint", None),
             }
@@ -1146,7 +1167,76 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             position_ids=position_ids,
             visual_coordinates=visual_coordinates,
         )
-        mark_profile("scope")
+        predictor_only = _predictor_only()
+        mark_profile("predictor_topk" if predictor_only else "scope")
+
+        if predictor_only:
+            # Predictor-only ablation: the selected TopK is the complete and
+            # only compression stage. Run the compact sequence through every
+            # decoder layer without SCOPE, mid-layer scoring/pruning, or a
+            # final visual-token wipe.
+            cache_position = torch.arange(
+                inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long
+            )
+            initial_cache = DynamicCache(config=self.model.config) if use_cache else None
+            hidden_states, next_cache, all_hidden_states, all_attns = self._manual_decode(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=initial_cache,
+                cache_position=cache_position,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            mark_profile("all_layers")
+
+            kept_visual_tokens = int(
+                scoped_input_ids[0].eq(IMAGE_TOKEN_INDEX).sum().item()
+            )
+            if getattr(self, "learnable_prune_stats", None):
+                self.learnable_prune_stats[-1].update(
+                    {
+                        "pruning_mode": "predictor_topk_only",
+                        "scope_enabled": False,
+                        "mid_layer_prune_enabled": False,
+                        "enable_finalwipe": False,
+                        "avg_visual_tokens_budget": float(kept_visual_tokens),
+                        "mid_pruned_visual_tokens": 0,
+                        "final_wiped_visual_tokens": 0,
+                        "final_sequence_tokens": int(attention_mask.shape[1]),
+                    }
+                )
+                if os.environ.get("LEARNABLE_PRUNE_DEBUG", "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }:
+                    print(
+                        "[learnable_prune_lightweight_predictor_only] "
+                        f"stats={self.learnable_prune_stats[-1]}",
+                        flush=True,
+                    )
+
+            if next_cache is not None:
+                self._set_cache_seen_tokens(next_cache, hidden_states.size(1))
+            self._scope_finalwipe_applied = True
+            self._scope_finalwipe_next_position_id = int(input_ids.shape[1])
+            if len(profile_events) > 1:
+                torch.cuda.synchronize(inputs_embeds.device)
+                segments = {
+                    profile_events[i][0]: profile_events[i - 1][1].elapsed_time(profile_events[i][1])
+                    for i in range(1, len(profile_events))
+                }
+                print(f"[learnable_prune_profile] {segments}", flush=True)
+            return (
+                hidden_states,
+                next_cache,
+                all_hidden_states,
+                all_attns,
+                scoped_input_ids,
+                attention_mask,
+                scoped_keep_positions,
+            )
+
         layers = self.model.layers
         enable_finalwipe = _enable_finalwipe(
             getattr(self, "learnable_prune_enable_final_wipe", ENABLE_FINALWIPE)

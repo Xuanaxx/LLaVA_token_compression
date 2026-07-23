@@ -635,6 +635,179 @@ def test_inference_loads_stage_budgets_from_training_checkpoint():
     assert model.learnable_prune_enable_final_wipe is False
 
 
+def test_predictor_only_inference_keeps_topk_through_all_layers_without_later_stages():
+    torch.manual_seed(13)
+    config = LlavaConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        pad_token_id=0,
+    )
+    config._attn_implementation = "eager"
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    model.learnable_prune_predictor = LearnablePrunePredictor(
+        input_size=16,
+        hidden_size=8,
+        rank=4,
+        num_heads=1,
+    ).eval()
+    model.learnable_prune_config = {"predictor_use_true_visual_coordinates": False}
+    model.learnable_prune_keep_k = 2
+    model.learnable_prune_active_budget_profile = {"avg_token_budget": 2}
+    model.learnable_prune_checkpoint = "test-checkpoint"
+    model.learnable_prune_stats = []
+    model.eval()
+
+    input_ids = torch.tensor(
+        [[7, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, 8]]
+    )
+    inputs_embeds = torch.randn(1, input_ids.shape[1], config.hidden_size)
+    attention_mask = torch.ones_like(input_ids)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    layer_calls = [0] * config.num_hidden_layers
+
+    def count_layer(layer_idx):
+        def hook(_module, _args, _output):
+            layer_calls[layer_idx] += 1
+
+        return hook
+
+    handles = [
+        layer.register_forward_hook(count_layer(layer_idx))
+        for layer_idx, layer in enumerate(model.model.layers)
+    ]
+    try:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_PREDICTOR": "1",
+                    "LEARNABLE_PRUNE_PREDICTOR_ONLY": "1",
+                    "LEARNABLE_TOPK": "2",
+                },
+                clear=False,
+            ),
+            patch(
+                "llava.model.learnable_prune_lightweight_scope_finalwipe.official_modeling.SeededResidualSCOPE",
+                side_effect=AssertionError("SCOPE must not run in predictor-only mode"),
+            ) as scope_mock,
+            patch.object(
+                model,
+                "_get_visual_token_attention_scores",
+                side_effect=AssertionError("mid-layer scoring must not run in predictor-only mode"),
+            ) as mid_score_mock,
+            patch.object(
+                model,
+                "_prune_by_mid_attention_scores",
+                side_effect=AssertionError("mid-layer pruning must not run in predictor-only mode"),
+            ) as mid_prune_mock,
+            patch.object(
+                model,
+                "_wipe_visual_tokens",
+                side_effect=AssertionError("final wipe must not run in predictor-only mode"),
+            ) as final_wipe_mock,
+        ):
+            outputs = model._prefill_with_finalwipe(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                visual_coordinates=None,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    hidden_states, past_key_values, _, _, pruned_input_ids, pruned_attention_mask, _ = outputs
+    assert layer_calls == [1, 1, 1]
+    assert hidden_states.shape[1] == 4
+    assert past_key_values.get_seq_length() == 4
+    assert int(pruned_input_ids.eq(IMAGE_TOKEN_INDEX).sum().item()) == 2
+    assert pruned_attention_mask.shape == (1, 4)
+    scope_mock.assert_not_called()
+    mid_score_mock.assert_not_called()
+    mid_prune_mock.assert_not_called()
+    final_wipe_mock.assert_not_called()
+
+    stats = model.learnable_prune_stats[-1]
+    assert stats["pruning_mode"] == "predictor_topk_only"
+    assert stats["scope_enabled"] is False
+    assert stats["scope_target_visual_tokens"] == 0
+    assert stats["mid_layer_prune_enabled"] is False
+    assert stats["enable_finalwipe"] is False
+    assert stats["avg_visual_tokens_budget"] == 2.0
+
+
+def test_scope_only_prefill_fills_from_empty_seed_to_avg64_scope_target_without_loading_predictor():
+    torch.manual_seed(17)
+    config = LlavaConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=192,
+        pad_token_id=0,
+    )
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    model.eval()
+
+    input_ids = torch.tensor([[7] + [IMAGE_TOKEN_INDEX] * 160 + [8]])
+    inputs_embeds = torch.randn(1, input_ids.shape[1], config.hidden_size)
+    attention_mask = torch.ones_like(input_ids)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ENABLE_PREDICTOR": "0",
+                "LEARNABLE_PRUNE_PREDICTOR_ONLY": "0",
+                "LEARNABLE_TOPK": "0",
+                "SCOPE_TARGET_COUNT": "137",
+            },
+            clear=False,
+        ),
+        patch.object(
+            model,
+            "_ensure_learnable_prune_loaded",
+            side_effect=AssertionError("scope-only mode must not load a predictor"),
+        ) as load_predictor_mock,
+        patch(
+            "llava.model.learnable_prune_lightweight_scope_finalwipe.official_modeling.SeededResidualSCOPE",
+            wraps=SeededResidualSCOPE,
+        ) as scope_mock,
+    ):
+        _, pruned_input_ids, pruned_attention_mask, _, _ = model._learnable_scope_prune_prefill(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            visual_coordinates=None,
+        )
+
+    load_predictor_mock.assert_not_called()
+    scope_mock.assert_called_once()
+    assert scope_mock.call_args.kwargs["seed_relative"].numel() == 0
+    assert scope_mock.call_args.kwargs["target_keep"] == 137
+    assert int(pruned_input_ids.eq(IMAGE_TOKEN_INDEX).sum().item()) == 137
+    assert pruned_attention_mask.shape == (1, 139)
+
+    stats = model.learnable_prune_stats[-1]
+    assert stats["enable_predictor"] is False
+    assert stats["learnable_topk_visual_tokens"] == 0
+    assert stats["scope_target_visual_tokens"] == 137
+    assert stats["kept_visual_tokens"] == 137
+
+
 def test_inference_selects_saved_multi_budget_profile():
     config = LlavaConfig(
         vocab_size=64,

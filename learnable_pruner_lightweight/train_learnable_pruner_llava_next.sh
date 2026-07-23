@@ -40,6 +40,7 @@ export LEARNABLE_PRUNE_BATCHED_SCORE_MAX_PADDING=${LEARNABLE_PRUNE_BATCHED_SCORE
 # Anyres batches fall back to row scoring when padding amplification is high;
 # keep their batched-path perturbation temporary conservative as well.
 export LEARNABLE_PRUNE_SCORE_TEMP_MIB=${LEARNABLE_PRUNE_SCORE_TEMP_MIB:-128}
+export WANDB_API_KEY="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"
 # Provide WANDB_API_KEY in the environment if needed.
 
 BATCH_SIZE=${BATCH_SIZE:-128}
