@@ -33,3 +33,7 @@ ckpts*
 
 # Demo
 serve_images/
+
+# my_projects
+results/
+samples/

@@ -6,6 +6,7 @@ from types import MethodType
 from unittest.mock import patch
 
 import torch
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -21,6 +22,9 @@ from learnable_pruner_lightweight.train_learnable_pruner import (
 )
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM
+from llava.model.learnable_prune_lightweight_scope_finalwipe import (
+    official_modeling as official_inference,
+)
 from llava.model.learnable_prune_lightweight_scope_finalwipe.official_modeling import (
     LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM,
     SeededResidualSCOPE,
@@ -808,6 +812,1286 @@ def test_scope_only_prefill_fills_from_empty_seed_to_avg64_scope_target_without_
     assert stats["kept_visual_tokens"] == 137
 
 
+def _make_fixed_greedy_generation_model(
+    constant_eos_head=False,
+    *,
+    device=None,
+    dtype=None,
+):
+    torch.manual_seed(29)
+    config = LlavaConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    config._attn_implementation = "eager"
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    model.eval()
+    if device is not None:
+        model.to(device=device, dtype=dtype)
+
+    expanded_input_ids = torch.tensor(
+        [[5, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, 6]],
+        device=device,
+    )
+    safe_embedding_ids = expanded_input_ids.masked_fill(
+        expanded_input_ids.eq(IMAGE_TOKEN_INDEX), 0
+    )
+    expanded_embeds = model.get_model().embed_tokens(safe_embedding_ids).detach()
+    # Visual embeddings are normally supplied by the projector. Keep them
+    # distinct from the pad embedding while avoiding a vision dependency.
+    visual_mask = expanded_input_ids.eq(IMAGE_TOKEN_INDEX).unsqueeze(-1)
+    expanded_embeds = torch.where(
+        visual_mask,
+        torch.randn_like(expanded_embeds),
+        expanded_embeds,
+    )
+    expanded_attention = torch.ones_like(expanded_input_ids)
+    expanded_positions = torch.arange(expanded_input_ids.shape[1]).unsqueeze(0)
+    expanded_coordinates = expanded_embeds.new_zeros(
+        (*expanded_input_ids.shape, 2)
+    )
+
+    def fake_multimodal_embedding(
+        _self,
+        _input_ids,
+        _images,
+        _attention_mask,
+        _position_ids,
+        image_sizes=None,
+    ):
+        del image_sizes
+        return (
+            expanded_embeds.clone(),
+            expanded_input_ids.clone(),
+            expanded_attention.clone(),
+            expanded_positions.clone(),
+            expanded_coordinates.clone(),
+        )
+
+    model._embed_multimodal_for_generation = MethodType(
+        fake_multimodal_embedding, model
+    )
+
+    if constant_eos_head:
+        class ConstantEosHead(torch.nn.Module):
+            def forward(self, hidden_states):
+                logits = hidden_states.new_zeros(
+                    (*hidden_states.shape[:-1], config.vocab_size)
+                )
+                logits[..., config.eos_token_id] = 10.0
+                logits[..., 7] = 9.0
+                return logits
+
+        model.lm_head = ConstantEosHead()
+
+    inputs = torch.tensor([[5, IMAGE_TOKEN_INDEX, 6]], device=device)
+    images = torch.zeros(
+        (1, 3, 2, 2),
+        device=device,
+        dtype=dtype,
+    )
+    generation_kwargs = {
+        "do_sample": False,
+        "num_beams": 1,
+        "use_cache": True,
+        "min_new_tokens": 3,
+        "max_new_tokens": 3,
+        "pad_token_id": config.pad_token_id,
+        "eos_token_id": config.eos_token_id,
+    }
+    pruning_env = {
+        "ENABLE_PREDICTOR": "0",
+        "LEARNABLE_PRUNE_PREDICTOR_ONLY": "0",
+        "SCOPE_TARGET_COUNT": "3",
+        "MID_PRUNING_LAYER_IDX": "1",
+        "MID_TARGET_COUNT": "2",
+        "ENABLE_FINALWIPE": "1",
+        "FINAL_WIPE_LAYER_IDX": "2",
+        "LEARNABLE_PRUNE_DIRECT_SDPA": "0",
+        "LEARNABLE_PRUNE_PROFILE_INTERNAL": "0",
+    }
+    return model, inputs, images, generation_kwargs, pruning_env
+
+
+def test_fixed_length_greedy_suppresses_eos_and_matches_hf_token_ids():
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=True)
+    )
+    with patch.dict(
+        os.environ,
+        {**pruning_env, "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1"},
+        clear=False,
+    ), patch.object(
+        model,
+        "_fixed_length_greedy_generate",
+        wraps=model._fixed_length_greedy_generate,
+    ) as fast_generate:
+        fast_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+    fast_generate.assert_called_once()
+    with patch.dict(
+        os.environ,
+        {**pruning_env, "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "0"},
+        clear=False,
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    assert torch.equal(fast_tokens, reference_tokens)
+    assert fast_tokens.tolist() == [[7, 7, 7]]
+
+
+def test_fixed_length_greedy_short_sequence_matches_hf_token_ids():
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    with patch.dict(
+        os.environ,
+        {**pruning_env, "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1"},
+        clear=False,
+    ):
+        fast_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+    with patch.dict(
+        os.environ,
+        {**pruning_env, "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "0"},
+        clear=False,
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    assert torch.equal(fast_tokens, reference_tokens)
+    assert fast_tokens.shape == (1, generation_kwargs["max_new_tokens"])
+
+
+def test_fixed_length_greedy_unsafe_arguments_fall_back():
+    model, inputs, images, generation_kwargs, _ = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    unsafe_overrides = (
+        {"do_sample": True},
+        {"num_beams": 2},
+        {"min_new_tokens": 2},
+        {"streamer": object()},
+        {"logits_processor": []},
+        {"stopping_criteria": []},
+        {"return_dict_in_generate": True},
+        {"output_scores": True},
+        {"temperature": 1.0},
+    )
+    for overrides in unsafe_overrides:
+        candidate = {**generation_kwargs, **overrides}
+        assert model._fixed_length_greedy_settings(candidate) is None
+
+    sentinel = torch.tensor([[41]])
+    with (
+        patch.object(
+            model,
+            "_fixed_length_greedy_generate",
+            side_effect=AssertionError("unsafe generation must not use the fast path"),
+        ),
+        patch(
+            "llava.model.learnable_prune_lightweight_scope_finalwipe."
+            "official_modeling.LlamaForCausalLM.generate",
+            return_value=sentinel,
+        ) as upstream_generate,
+    ):
+        result = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            streamer=object(),
+            **generation_kwargs,
+        )
+    assert torch.equal(result, sentinel)
+    upstream_generate.assert_called_once()
+
+
+def test_fixed_length_greedy_argmax_matches_fp32_min_new_token_processing():
+    logits = torch.tensor(
+        [[0.5, 0.25, 12.0, 3.0, 11.0, -2.0]], dtype=torch.bfloat16
+    )
+    eos_token_ids = (2, 4)
+    reference = logits.float()
+    reference[..., list(eos_token_ids)] = float("-inf")
+    expected = torch.argmax(reference, dim=-1)
+    actual = (
+        LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM
+        ._fixed_length_greedy_next_token(logits, eos_token_ids)
+    )
+    assert torch.equal(actual, expected)
+    assert actual.tolist() == [3]
+
+
+def test_triton_rmsnorm_unsafe_and_runtime_failure_paths_fall_back_exactly():
+    torch.manual_seed(31)
+    norm = LlamaRMSNorm(4096, eps=1e-6).eval().to(torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(
+            torch.empty_like(norm.weight).uniform_(0.25, 1.75)
+        )
+    hidden_states = torch.randn(1, 3, 4096, dtype=torch.bfloat16)
+
+    with (
+        torch.inference_mode(),
+        patch.dict(
+            os.environ,
+            {"LEARNABLE_PRUNE_TRITON_RMS": "1"},
+            clear=False,
+        ),
+        patch.object(
+            official_inference,
+            "_launch_triton_rms_norm",
+            side_effect=AssertionError("CPU input must never launch Triton"),
+        ) as launch,
+    ):
+        expected = norm(hidden_states)
+        actual = official_inference._apply_rms_norm(norm, hidden_states)
+    assert torch.equal(actual, expected)
+    assert not official_inference._triton_rms_norm_is_eligible(
+        norm, hidden_states
+    )
+    launch.assert_not_called()
+
+    previous_disabled = official_inference._TRITON_RMS_RUNTIME_DISABLED
+    try:
+        official_inference._TRITON_RMS_RUNTIME_DISABLED = False
+        with (
+            torch.inference_mode(),
+            patch.dict(
+                os.environ,
+                {"LEARNABLE_PRUNE_TRITON_RMS": "1"},
+                clear=False,
+            ),
+            patch.object(
+                official_inference,
+                "_triton_rms_norm_is_eligible",
+                return_value=True,
+            ),
+            patch.object(
+                official_inference,
+                "_launch_triton_rms_norm",
+                side_effect=RuntimeError("synthetic Triton compile failure"),
+            ) as failed_launch,
+        ):
+            recovered = official_inference._apply_rms_norm(
+                norm, hidden_states
+            )
+        failed_launch.assert_called_once()
+        assert torch.equal(recovered, expected)
+        assert official_inference._TRITON_RMS_RUNTIME_DISABLED is True
+    finally:
+        official_inference._TRITON_RMS_RUNTIME_DISABLED = previous_disabled
+
+
+def test_triton_rmsnorm_preserves_attached_module_hook_boundaries():
+    norm = LlamaRMSNorm(4096, eps=1e-6).eval().to(torch.bfloat16)
+    hidden_states = torch.randn(1, 1, 4096, dtype=torch.bfloat16)
+    expected = norm(hidden_states)
+    hook_shapes = []
+    handle = norm.register_forward_pre_hook(
+        lambda _module, args: hook_shapes.append(tuple(args[0].shape))
+    )
+    try:
+        with (
+            torch.inference_mode(),
+            patch.object(
+                official_inference,
+                "_triton_rms_norm_is_eligible",
+                return_value=True,
+            ),
+            patch.object(
+                official_inference,
+                "_launch_triton_rms_norm",
+                side_effect=AssertionError(
+                    "An instrumented norm must use Module.__call__"
+                ),
+            ) as launch,
+        ):
+            actual = official_inference._apply_rms_norm(
+                norm,
+                hidden_states,
+            )
+    finally:
+        handle.remove()
+
+    launch.assert_not_called()
+    assert hook_shapes == [(1, 1, 4096)]
+    assert torch.equal(actual, expected)
+
+
+def test_triton_rmsnorm_prefill_is_bitwise_exact_and_decode_falls_back():
+    # This is opt-in so the regular CPU suite never claims or occupies a GPU.
+    # Run on the benchmark device with:
+    # LEARNABLE_PRUNE_RUN_TRITON_RMS_CUDA_TEST=1 CUDA_VISIBLE_DEVICES=2 ...
+    if os.environ.get(
+        "LEARNABLE_PRUNE_RUN_TRITON_RMS_CUDA_TEST", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not torch.cuda.is_available():
+        raise AssertionError("The requested Triton RMSNorm test needs CUDA")
+    if official_inference._triton_rms_kernel is None:
+        raise AssertionError("The requested Triton RMSNorm test needs Triton")
+
+    torch.manual_seed(37)
+    torch.cuda.manual_seed_all(37)
+    device = torch.device("cuda")
+    norm = (
+        LlamaRMSNorm(4096, eps=1e-6)
+        .eval()
+        .to(device=device, dtype=torch.bfloat16)
+    )
+    with torch.no_grad():
+        norm.weight.copy_(
+            torch.empty_like(norm.weight).uniform_(0.25, 1.75)
+        )
+
+    previous_disabled = official_inference._TRITON_RMS_RUNTIME_DISABLED
+    try:
+        official_inference._TRITON_RMS_RUNTIME_DISABLED = False
+        with (
+            torch.inference_mode(),
+            patch.dict(
+                os.environ,
+                {"LEARNABLE_PRUNE_TRITON_RMS": "1"},
+                clear=False,
+            ),
+            patch.object(
+                official_inference,
+                "_launch_triton_rms_norm",
+                wraps=official_inference._launch_triton_rms_norm,
+            ) as launch,
+        ):
+            for sequence_length in (1, 2, 8, 15, 49, 81, 186, 625):
+                hidden_states = torch.randn(
+                    1,
+                    sequence_length,
+                    4096,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                eligible = (
+                    official_inference._triton_rms_norm_is_eligible(
+                        norm, hidden_states
+                    )
+                )
+                assert eligible is (sequence_length >= 16)
+                expected = norm(hidden_states)
+                actual = official_inference._apply_rms_norm(
+                    norm, hidden_states
+                )
+                assert torch.isfinite(actual).all()
+                assert torch.isfinite(expected).all()
+                assert torch.equal(actual, expected)
+        # Short shapes deliberately use LlamaRMSNorm's wider block-x
+        # reductions. The four >=16-row prefill shapes exercise the exact
+        # fused one-warp-per-row tree.
+        assert launch.call_count == 4
+        assert official_inference._TRITON_RMS_RUNTIME_DISABLED is False
+    finally:
+        official_inference._TRITON_RMS_RUNTIME_DISABLED = previous_disabled
+
+
+def test_triton_rms_switch_preserves_full_fixed_greedy_token_ids():
+    # This CPU-sized model exercises every integration site through the safe
+    # fallback. Since the CUDA specialization deliberately requires hidden
+    # size 4096, a slow/fast token-ID hash comparison on the real checkpoint is
+    # still required before enabling the optimization in a benchmark run.
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    model.config._attn_implementation = "sdpa"
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_DIRECT_SDPA": "1",
+    }
+    with patch.dict(
+        os.environ,
+        {**common_env, "LEARNABLE_PRUNE_TRITON_RMS": "0"},
+        clear=False,
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+    with (
+        patch.dict(
+            os.environ,
+            {**common_env, "LEARNABLE_PRUNE_TRITON_RMS": "1"},
+            clear=False,
+        ),
+        patch.object(
+            official_inference,
+            "_apply_rms_norm",
+            wraps=official_inference._apply_rms_norm,
+        ) as rms_calls,
+    ):
+        candidate_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    assert rms_calls.call_count > 0
+    assert torch.equal(candidate_tokens, reference_tokens)
+
+
+def test_heterogeneous_static_cache_matches_dynamic_cat_and_resets_prefixes():
+    torch.manual_seed(41)
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+    source = official_inference.DynamicCache(config=config)
+    base_lengths = (5, 3, 1)
+    reference_keys = []
+    reference_values = []
+    for layer_idx, base_length in enumerate(base_lengths):
+        keys = torch.randn(1, 2, base_length, 4)
+        values = torch.randn_like(keys)
+        source.update(keys, values, layer_idx)
+        reference_keys.append(keys)
+        reference_values.append(values)
+
+    static = official_inference._HeterogeneousStaticCache.from_cache(
+        source,
+        max_decode_steps=3,
+    )
+    assert static.base_lengths == base_lengths
+    assert [
+        tensor.shape[-2] for tensor in static.key_cache
+    ] == [8, 6, 4]
+
+    for step in range(3):
+        static.set_decode_step(step)
+        for layer_idx, base_length in enumerate(base_lengths):
+            new_keys = torch.randn(1, 2, 1, 4)
+            new_values = torch.randn_like(new_keys)
+            reference_keys[layer_idx] = torch.cat(
+                (reference_keys[layer_idx], new_keys),
+                dim=-2,
+            )
+            reference_values[layer_idx] = torch.cat(
+                (reference_values[layer_idx], new_values),
+                dim=-2,
+            )
+            actual_keys, actual_values = static.update(
+                new_keys,
+                new_values,
+                layer_idx,
+            )
+            assert actual_keys.is_contiguous()
+            assert actual_values.is_contiguous()
+            assert torch.equal(actual_keys, reference_keys[layer_idx])
+            assert torch.equal(actual_values, reference_values[layer_idx])
+            assert actual_keys.shape[-2] == base_length + step + 1
+        assert [
+            static.get_seq_length(layer_idx) for layer_idx in range(3)
+        ] == [length + step + 1 for length in base_lengths]
+
+    replacement = official_inference.DynamicCache(config=config)
+    replacement_keys = []
+    replacement_values = []
+    for layer_idx, base_length in enumerate(base_lengths):
+        keys = torch.randn(1, 2, base_length, 4)
+        values = torch.randn_like(keys)
+        replacement.update(keys, values, layer_idx)
+        replacement_keys.append(keys)
+        replacement_values.append(values)
+    static.copy_prefill_from(replacement)
+
+    assert [
+        static.get_seq_length(layer_idx) for layer_idx in range(3)
+    ] == list(base_lengths)
+    for layer_idx in range(3):
+        actual_keys, actual_values = static[layer_idx]
+        assert torch.equal(actual_keys, replacement_keys[layer_idx])
+        assert torch.equal(actual_values, replacement_values[layer_idx])
+
+
+def test_static_kv_eager_decode_matches_dynamic_cache_token_ids():
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "0",
+    }
+    with patch.dict(
+        os.environ,
+        {**common_env, "LEARNABLE_PRUNE_STATIC_KV_DECODE": "0"},
+        clear=False,
+    ):
+        dynamic_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    with (
+        patch.dict(
+            os.environ,
+            {**common_env, "LEARNABLE_PRUNE_STATIC_KV_DECODE": "1"},
+            clear=False,
+        ),
+        patch.object(
+            official_inference._HeterogeneousStaticCache,
+            "from_cache",
+            wraps=official_inference._HeterogeneousStaticCache.from_cache,
+        ) as static_cache_factory,
+    ):
+        static_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    static_cache_factory.assert_called_once()
+    assert torch.equal(static_tokens, dynamic_tokens)
+
+
+def test_cuda_graph_boundary_callback_registration_and_removal():
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+    )
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    events = []
+    handle = model.register_cuda_graph_decode_boundary_callback(
+        lambda phase, step: events.append((phase, step))
+    )
+    model._emit_cuda_graph_decode_boundary("decode_start", 1)
+    model._emit_cuda_graph_decode_boundary("decode_end", 1)
+    handle.remove()
+    model._emit_cuda_graph_decode_boundary("decode_start", 2)
+
+    assert events == [("decode_start", 1), ("decode_end", 1)]
+
+
+def test_cuda_graph_prefill_callback_registration_and_diagnostics():
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+    )
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    events = []
+    handle = model.register_cuda_graph_prefill_boundary_callback(
+        lambda phase, runner_id: events.append((phase, runner_id))
+    )
+    model._emit_cuda_graph_prefill_boundary("prefill_start", 7)
+    model._emit_cuda_graph_prefill_boundary("prefill_end", 7)
+    handle.remove()
+    model._emit_cuda_graph_prefill_boundary("prefill_start", 8)
+
+    diagnostics = model.get_cuda_graph_prefill_diagnostics()
+    assert events == [("prefill_start", 7), ("prefill_end", 7)]
+    assert diagnostics["enabled"] is False
+    assert diagnostics["cache_entries"] == 0
+    assert diagnostics["captures"] == 0
+    assert diagnostics["replay_successes"] == 0
+    assert diagnostics["last_status"] == "never_attempted"
+
+
+def test_cuda_graph_prefill_detects_rotary_forward_hooks():
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+    )
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    assert model._decoder_prefill_has_forward_hooks() is False
+    handle = model.model.rotary_emb.register_forward_hook(
+        lambda _module, _args, _output: None
+    )
+    try:
+        assert model._decoder_prefill_has_forward_hooks() is True
+    finally:
+        handle.remove()
+    assert model._decoder_prefill_has_forward_hooks() is False
+
+
+def test_cuda_graph_prefill_public_forward_stays_eager():
+    model, inputs, images, _, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    (
+        inputs_embeds,
+        expanded_input_ids,
+        expanded_attention,
+        expanded_positions,
+        visual_coordinates,
+    ) = model._embed_multimodal_for_generation(
+        inputs,
+        images,
+        torch.ones_like(inputs),
+        None,
+    )
+    with (
+        torch.inference_mode(),
+        patch.dict(
+            os.environ,
+            {
+                **pruning_env,
+                "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1",
+            },
+            clear=False,
+        ),
+        patch.object(
+            official_inference,
+            "_ThreeSegmentPrefillCudaGraphRunner",
+            side_effect=AssertionError(
+                "Public forward must not expose graph-backed outputs"
+            ),
+        ) as graph_runner,
+    ):
+        outputs = model.forward(
+            input_ids=None,
+            attention_mask=expanded_attention,
+            position_ids=expanded_positions,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            logits_to_keep=1,
+            learnable_prune_input_ids=expanded_input_ids,
+            learnable_prune_visual_coordinates=visual_coordinates,
+        )
+        diagnostics = model.get_cuda_graph_prefill_diagnostics()
+
+    graph_runner.assert_not_called()
+    assert outputs.logits.shape == (1, 1, model.vocab_size)
+    assert diagnostics["captures"] == 0
+    assert diagnostics["cache_entries"] == 0
+    assert (
+        diagnostics["last_status"]
+        == "ineligible:outside_fixed_length_greedy_generate"
+    )
+
+
+def test_cuda_graph_prefill_callback_failure_preserves_warmed_runner():
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+    )
+    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(config)
+    cache_key = ("warmed-runner",)
+    expected_result = ("successful-replay",)
+
+    class FakeWarmedRunner:
+        runner_id = 19
+        replay_count = 0
+
+        def run(self, **_kwargs):
+            model._emit_cuda_graph_prefill_boundary(
+                "prefill_start",
+                self.runner_id,
+            )
+            model._emit_cuda_graph_prefill_boundary(
+                "prefill_end",
+                self.runner_id,
+            )
+            self.replay_count += 1
+            return expected_result
+
+    runner = FakeWarmedRunner()
+    model._prefill_cuda_graph_runners[cache_key] = runner
+    tensors = {
+        "scoped_hidden_states": torch.zeros(1),
+        "scoped_input_ids": torch.zeros(1),
+        "scoped_attention_mask": torch.zeros(1),
+        "scoped_position_ids": torch.zeros(1),
+        "scoped_keep_positions": torch.zeros(1),
+    }
+    options = {
+        "use_cache": True,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "capture_last_logit": True,
+        "predictor_only": False,
+        "enable_finalwipe": True,
+        "mid_pruning_layer_idx": 1,
+        "mid_scoring_layer_idx": 1,
+        "wipe_layer_idx": 2,
+        "mid_attn_anchor": "query",
+        "mid_target_count": 1,
+        "scoped_visual_tokens": 0,
+    }
+    handle = model.register_cuda_graph_prefill_boundary_callback(
+        lambda phase, _runner_id: (
+            (_ for _ in ()).throw(RuntimeError(f"synthetic {phase} failure"))
+        )
+    )
+    try:
+        with (
+            patch.dict(
+                os.environ,
+                {"LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1"},
+                clear=False,
+            ),
+            patch.object(
+                model,
+                "_cuda_graph_prefill_ineligibility",
+                return_value=None,
+            ),
+            patch.object(
+                model,
+                "_cuda_graph_prefill_cache_key",
+                return_value=cache_key,
+            ),
+        ):
+            try:
+                model._try_cuda_graph_prefill(**tensors, **options)
+            except RuntimeError as exc:
+                assert "boundary callback failed" in str(exc)
+                assert isinstance(exc.__cause__, RuntimeError)
+                assert "synthetic prefill_start failure" in str(exc.__cause__)
+            else:
+                raise AssertionError("The callback failure must remain visible")
+    finally:
+        handle.remove()
+
+    assert model._prefill_cuda_graph_runners[cache_key] is runner
+    assert runner.replay_count == 0
+    assert model._cuda_graph_prefill_counters["replay_failures"] == 0
+    assert model._cuda_graph_prefill_counters["last_status"] == "callback_failure"
+
+    with (
+        patch.dict(
+            os.environ,
+            {"LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1"},
+            clear=False,
+        ),
+        patch.object(
+            model,
+            "_cuda_graph_prefill_ineligibility",
+            return_value=None,
+        ),
+        patch.object(
+            model,
+            "_cuda_graph_prefill_cache_key",
+            return_value=cache_key,
+        ),
+    ):
+        actual_result = model._try_cuda_graph_prefill(
+            **tensors,
+            **options,
+        )
+
+    diagnostics = model.get_cuda_graph_prefill_diagnostics()
+    assert actual_result is expected_result
+    assert model._prefill_cuda_graph_runners[cache_key] is runner
+    assert runner.replay_count == 1
+    assert diagnostics["cached_failures"] == 0
+    assert diagnostics["replay_failures"] == 0
+    assert diagnostics["replay_successes"] == 1
+
+
+def test_cuda_graph_prefill_cpu_safely_falls_back_without_callbacks():
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0",
+        "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "0",
+    }
+    with patch.dict(os.environ, common_env, clear=False):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    boundary_events = []
+    handle = model.register_cuda_graph_prefill_boundary_callback(
+        lambda phase, runner_id: boundary_events.append(
+            (phase, runner_id)
+        )
+    )
+    try:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **common_env,
+                    "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1",
+                },
+                clear=False,
+            ),
+            patch.object(
+                official_inference,
+                "_ThreeSegmentPrefillCudaGraphRunner",
+                side_effect=AssertionError(
+                    "CPU must not attempt prefill CUDA capture"
+                ),
+            ) as graph_runner,
+        ):
+            fallback_tokens = model.generate(
+                inputs=inputs,
+                images=images,
+                attention_mask=torch.ones_like(inputs),
+                **generation_kwargs,
+            )
+            diagnostics = model.get_cuda_graph_prefill_diagnostics()
+    finally:
+        handle.remove()
+
+    graph_runner.assert_not_called()
+    assert boundary_events == []
+    assert torch.equal(fallback_tokens, reference_tokens)
+    assert diagnostics["captures"] == 0
+    assert diagnostics["eager_fallbacks"] >= 1
+    assert diagnostics["last_status"].startswith("ineligible:")
+
+
+def test_cuda_graph_prefill_matches_tokens_and_emits_replay_boundaries():
+    if os.environ.get(
+        "LEARNABLE_PRUNE_RUN_CUDA_GRAPH_TEST", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not torch.cuda.is_available():
+        raise AssertionError("The requested CUDA Graph prefill test needs CUDA")
+
+    device = torch.device("cuda")
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(
+            constant_eos_head=False,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    )
+    model.config._attn_implementation = "sdpa"
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_DIRECT_SDPA": "1",
+        "LEARNABLE_PRUNE_IMPLICIT_CAUSAL": "1",
+        "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0",
+        "LEARNABLE_PRUNE_STATIC_KV_DECODE": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "1",
+    }
+    with (
+        torch.inference_mode(),
+        patch.dict(
+            os.environ,
+            {
+                **common_env,
+                "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "0",
+            },
+            clear=False,
+        ),
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    # First call constructs/captures without callback instrumentation.
+    with (
+        torch.inference_mode(),
+        patch.dict(
+            os.environ,
+            {
+                **common_env,
+                "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1",
+            },
+            clear=False,
+        ),
+    ):
+        captured_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+    diagnostics_after_capture = model.get_cuda_graph_prefill_diagnostics()
+    assert diagnostics_after_capture["captures"] == 1
+    assert diagnostics_after_capture["replay_successes"] == 1
+
+    events = []
+    handle = model.register_cuda_graph_prefill_boundary_callback(
+        lambda phase, runner_id: events.append((phase, runner_id))
+    )
+    try:
+        with (
+            torch.inference_mode(),
+            patch.dict(
+                os.environ,
+                {
+                    **common_env,
+                    "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL": "1",
+                },
+                clear=False,
+            ),
+        ):
+            replayed_tokens = model.generate(
+                inputs=inputs,
+                images=images,
+                attention_mask=torch.ones_like(inputs),
+                **generation_kwargs,
+            )
+    finally:
+        handle.remove()
+
+    diagnostics = model.get_cuda_graph_prefill_diagnostics()
+    runner_id = diagnostics["last_runner_id"]
+    assert events == [
+        ("prefill_start", runner_id),
+        ("prefill_end", runner_id),
+    ]
+    assert diagnostics["captures"] == 1
+    assert diagnostics["cache_hits"] >= 1
+    assert diagnostics["replay_successes"] == 2
+    assert diagnostics["runners"][0]["replay_count"] == 2
+    assert torch.equal(captured_tokens, reference_tokens)
+    assert torch.equal(replayed_tokens, reference_tokens)
+
+
+def test_cuda_graph_decode_cpu_safely_falls_back_to_dynamic_cache():
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(constant_eos_head=False)
+    )
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_STATIC_KV_DECODE": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "0",
+    }
+    with patch.dict(
+        os.environ,
+        {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0"},
+        clear=False,
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+    boundary_events = []
+    handle = model.register_cuda_graph_decode_boundary_callback(
+        lambda phase, step: boundary_events.append((phase, step))
+    )
+    with (
+        patch.dict(
+            os.environ,
+            {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "1"},
+            clear=False,
+        ),
+        patch.object(
+            official_inference,
+            "_FixedGreedyCudaGraphRunner",
+            side_effect=AssertionError("CPU must not attempt CUDA capture"),
+        ) as graph_runner,
+    ):
+        try:
+            fallback_tokens = model.generate(
+                inputs=inputs,
+                images=images,
+                attention_mask=torch.ones_like(inputs),
+                **generation_kwargs,
+            )
+        finally:
+            handle.remove()
+
+    graph_runner.assert_not_called()
+    assert boundary_events == []
+    assert torch.equal(fallback_tokens, reference_tokens)
+
+
+def test_cuda_graph_decode_matches_tokens_and_emits_replay_boundaries():
+    if os.environ.get(
+        "LEARNABLE_PRUNE_RUN_CUDA_GRAPH_TEST", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not torch.cuda.is_available():
+        raise AssertionError("The requested CUDA Graph decode test needs CUDA")
+
+    device = torch.device("cuda")
+    model, inputs, images, generation_kwargs, pruning_env = (
+        _make_fixed_greedy_generation_model(
+            constant_eos_head=False,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    )
+    model.config._attn_implementation = "sdpa"
+    common_env = {
+        **pruning_env,
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_DIRECT_SDPA": "1",
+        "LEARNABLE_PRUNE_STATIC_KV_DECODE": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "0",
+    }
+    with (
+        torch.inference_mode(),
+        patch.dict(
+            os.environ,
+            {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0"},
+            clear=False,
+        ),
+    ):
+        reference_tokens = model.generate(
+            inputs=inputs,
+            images=images,
+            attention_mask=torch.ones_like(inputs),
+            **generation_kwargs,
+        )
+
+    events = []
+    handle = model.register_cuda_graph_decode_boundary_callback(
+        lambda phase, step: events.append((phase, step))
+    )
+    try:
+        with (
+            torch.inference_mode(),
+            patch.dict(
+                os.environ,
+                {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "1"},
+                clear=False,
+            ),
+        ):
+            captured_tokens = model.generate(
+                inputs=inputs,
+                images=images,
+                attention_mask=torch.ones_like(inputs),
+                **generation_kwargs,
+            )
+            assert any(
+                isinstance(
+                    runner,
+                    official_inference._FixedGreedyCudaGraphRunner,
+                )
+                for runner in model._fixed_greedy_cuda_graph_runners.values()
+            )
+            events.clear()
+            replayed_tokens = model.generate(
+                inputs=inputs,
+                images=images,
+                attention_mask=torch.ones_like(inputs),
+                **generation_kwargs,
+            )
+    finally:
+        handle.remove()
+
+    expected_events = [
+        event
+        for step in range(1, generation_kwargs["max_new_tokens"])
+        for event in (("decode_start", step), ("decode_end", step))
+    ]
+    assert events == expected_events
+    assert torch.equal(captured_tokens, reference_tokens)
+    assert torch.equal(replayed_tokens, reference_tokens)
+
+
+def test_cuda_graph_decode_full_checkpoint_32_image_token_hash_gate():
+    if os.environ.get(
+        "LEARNABLE_PRUNE_RUN_FULL_CUDA_GRAPH_TEST", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not torch.cuda.is_available():
+        raise AssertionError("The full CUDA Graph gate requires CUDA")
+
+    import hashlib
+
+    from efficiency_exp import benchmark_efficiency_v2 as benchmark
+    from efficiency_exp import efficiency_v2_runtime as runtime
+
+    visible_device = os.environ.get("CUDA_VISIBLE_DEVICES")
+    argv = [
+        "benchmark_efficiency_v2.py",
+        "--method",
+        "ours",
+        "--num-samples",
+        "32",
+        "--warmup",
+        "0",
+        "--max-new-tokens",
+        "32",
+        "--device",
+        "cuda:0",
+        "--expected-cuda-visible-devices",
+        str(visible_device),
+    ]
+    with patch.object(sys, "argv", argv):
+        args = benchmark.parse_args()
+    runtime.validate_environment(args)
+    rows = runtime.load_rows(
+        args.sample_parquet.expanduser().resolve(),
+        32,
+    )
+    common_env = {
+        "LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY": "1",
+        "LEARNABLE_PRUNE_DIRECT_SDPA": "1",
+        "LEARNABLE_PRUNE_STATIC_KV_DECODE": "0",
+        "LEARNABLE_PRUNE_TRITON_RMS": "0",
+    }
+    adapter = None
+    try:
+        with patch.dict(
+            os.environ,
+            {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0"},
+            clear=False,
+        ):
+            adapter = runtime.ModelAdapter(
+                args,
+                attach_token_tracer=False,
+            )
+
+        # Build all step-specific graphs outside measured calls.
+        first_prepared = adapter.prepare(rows[0])
+        with (
+            torch.inference_mode(),
+            patch.dict(
+                os.environ,
+                {**common_env, "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "1"},
+                clear=False,
+            ),
+        ):
+            captured_first = adapter.generate(
+                first_prepared,
+                args.max_new_tokens,
+            )
+        assert any(
+            isinstance(
+                runner,
+                official_inference._FixedGreedyCudaGraphRunner,
+            )
+            for runner in adapter.model._fixed_greedy_cuda_graph_runners.values()
+        )
+
+        eager_digest = hashlib.sha256()
+        graph_digest = hashlib.sha256()
+        eager_ms = []
+        graph_ms = []
+        for row_index, row in enumerate(rows):
+            prepared = (
+                first_prepared
+                if row_index == 0
+                else adapter.prepare(row)
+            )
+            with (
+                torch.inference_mode(),
+                patch.dict(
+                    os.environ,
+                    {
+                        **common_env,
+                        "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "0",
+                    },
+                    clear=False,
+                ),
+            ):
+                eager_tokens, eager_cuda_ms, _ = runtime.timed_generate(
+                    adapter,
+                    prepared,
+                    args.max_new_tokens,
+                )
+            with (
+                torch.inference_mode(),
+                patch.dict(
+                    os.environ,
+                    {
+                        **common_env,
+                        "LEARNABLE_PRUNE_CUDA_GRAPH_DECODE": "1",
+                    },
+                    clear=False,
+                ),
+            ):
+                graph_tokens, graph_cuda_ms, _ = runtime.timed_generate(
+                    adapter,
+                    prepared,
+                    args.max_new_tokens,
+                )
+            if row_index == 0:
+                assert torch.equal(captured_first, eager_tokens)
+            if not torch.equal(graph_tokens, eager_tokens):
+                raise AssertionError(
+                    f"CUDA Graph token mismatch at DetailCaps row {row_index}"
+                )
+            eager_cpu = eager_tokens.detach().cpu().contiguous()
+            graph_cpu = graph_tokens.detach().cpu().contiguous()
+            eager_digest.update(eager_cpu.numpy().tobytes())
+            graph_digest.update(graph_cpu.numpy().tobytes())
+            eager_ms.append(float(eager_cuda_ms))
+            graph_ms.append(float(graph_cuda_ms))
+
+        assert eager_digest.hexdigest() == graph_digest.hexdigest()
+        print(
+            "[cuda_graph_full_gate] "
+            f"images={len(rows)} hash={eager_digest.hexdigest()} "
+            f"eager_mean_ms={sum(eager_ms) / len(eager_ms):.6f} "
+            f"graph_mean_ms={sum(graph_ms) / len(graph_ms):.6f}",
+            flush=True,
+        )
+    finally:
+        if adapter is not None:
+            adapter.close()
+
+
 def test_inference_selects_saved_multi_budget_profile():
     config = LlavaConfig(
         vocab_size=64,
@@ -964,4 +2248,9 @@ if __name__ == "__main__":
     test_inference_loads_stage_budgets_from_training_checkpoint()
     test_inference_selects_saved_multi_budget_profile()
     test_full_loss_backward_updates_predictor_through_three_stage_student()
+    test_cuda_graph_prefill_callback_registration_and_diagnostics()
+    test_cuda_graph_prefill_detects_rotary_forward_hooks()
+    test_cuda_graph_prefill_public_forward_stays_eager()
+    test_cuda_graph_prefill_callback_failure_preserves_warmed_runner()
+    test_cuda_graph_prefill_cpu_safely_falls_back_without_callbacks()
     print("three-stage alignment tests passed")

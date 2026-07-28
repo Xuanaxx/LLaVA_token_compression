@@ -1,0 +1,13 @@
+__pycache__/
+samples/*.parquet
+results/*.log
+results/smoke_*
+
+# The repository-wide ignore file excludes JSON.  Keep small protocol/result
+# metadata visible while leaving the 100+ MiB sampled parquet untracked.
+!samples/*_metadata.json
+!results/*.metadata.json
+
+# One-off validation runs are intentionally excluded from the formal report.
+results/smoke_*
+results/pilot*/

@@ -4,18 +4,35 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import time
 from collections import OrderedDict
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.hooks import RemovableHandle
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, apply_rotary_pos_emb
+from transformers.models.llama.modeling_llama import (
+    LlamaForCausalLM,
+    LlamaRMSNorm,
+    apply_rotary_pos_emb,
+)
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    # Triton is an optional inference optimization. Import failures must not
+    # prevent the model from loading on CPU or on unsupported installations.
+    triton = None
+    tl = None
 
 try:
     from transformers.models.llama.modeling_llama import create_causal_mask as llama_create_causal_mask
@@ -41,6 +58,132 @@ ENABLE_PREDICTOR = True
 _SCOPE_GRAPH_CACHE: "OrderedDict[Tuple[Any, ...], Any]" = OrderedDict()
 _CAUSAL_BOOL_MASK_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
 _VISUAL_COORDINATE_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
+_TRITON_RMS_RUNTIME_DISABLED = False
+_TRITON_RMS_EXACT_TORCH_GIT_VERSION = (
+    "5811a8d7da873dd699ff6687092c225caffcf1bb"
+)
+_CUDA_GRAPH_PREFILL_GENERATION_OWNER: ContextVar[Optional[int]] = ContextVar(
+    "learnable_prune_cuda_graph_prefill_generation_owner",
+    default=None,
+)
+
+
+if triton is not None:
+    @triton.jit
+    def _triton_add_rounded_square(accumulator, value):
+        """Match eager ``float_value.pow(2)`` followed by FP32 accumulation.
+
+        Keeping the multiply and add as two explicitly rounded instructions
+        prevents NVVM from contracting them into an FMA.  Eager LlamaRMSNorm
+        materializes the squared FP32 tensor before reducing it.
+        """
+        return tl.inline_asm_elementwise(
+            """
+            {
+              .reg .f32 square;
+              mul.rn.f32 square, $2, $2;
+              add.rn.f32 $0, $1, square;
+            }
+            """,
+            "=f,f,f",
+            [accumulator, value],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+
+    @triton.jit
+    def _triton_torch_2_9_1_warp_sum(value):
+        """Reproduce Reduce.cuh's offset-increasing warp reduction."""
+        return tl.inline_asm_elementwise(
+            """
+            {
+              .reg .f32 other;
+              shfl.sync.down.b32 other, $1, 1, 31, 0xffffffff;
+              add.rn.f32 $0, $1, other;
+              shfl.sync.down.b32 other, $0, 2, 31, 0xffffffff;
+              add.rn.f32 $0, $0, other;
+              shfl.sync.down.b32 other, $0, 4, 31, 0xffffffff;
+              add.rn.f32 $0, $0, other;
+              shfl.sync.down.b32 other, $0, 8, 31, 0xffffffff;
+              add.rn.f32 $0, $0, other;
+              shfl.sync.down.b32 other, $0, 16, 31, 0xffffffff;
+              add.rn.f32 $0, $0, other;
+              shfl.sync.idx.b32 $0, $0, 0, 31, 0xffffffff;
+            }
+            """,
+            "=f,f",
+            [value],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+
+    @triton.jit
+    def _triton_rms_kernel(
+        hidden_states,
+        weight,
+        output,
+        hidden_size: tl.constexpr,
+        epsilon: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        # This reduction reproduces the exact CUDA tree used by the pinned
+        # PyTorch 2.9.1 build.  Reduce.cuh assigns one warp per row: each lane
+        # loads four adjacent FP32 values over 32 iterations, combines its four
+        # accumulators left-to-right, then reduces with shfl-down offsets
+        # 1,2,4,8,16.  Triton's generic tl.sum uses the reverse tree and differs
+        # at a small number of BF16 rounding boundaries on long prefill rows.
+        row = tl.program_id(0)
+        lanes = tl.arange(0, 32)
+        row_base = row * hidden_size
+        acc0 = tl.zeros((32,), tl.float32)
+        acc1 = tl.zeros((32,), tl.float32)
+        acc2 = tl.zeros((32,), tl.float32)
+        acc3 = tl.zeros((32,), tl.float32)
+        for iteration in tl.static_range(0, 32):
+            base = row_base + iteration * 128 + lanes * 4
+            value0 = tl.load(hidden_states + base).to(tl.float32)
+            value1 = tl.load(hidden_states + base + 1).to(tl.float32)
+            value2 = tl.load(hidden_states + base + 2).to(tl.float32)
+            value3 = tl.load(hidden_states + base + 3).to(tl.float32)
+            acc0 = _triton_add_rounded_square(acc0, value0)
+            acc1 = _triton_add_rounded_square(acc1, value1)
+            acc2 = _triton_add_rounded_square(acc2, value2)
+            acc3 = _triton_add_rounded_square(acc3, value3)
+
+        lane_sum = ((acc0 + acc1) + acc2) + acc3
+        total_lanes = _triton_torch_2_9_1_warp_sum(lane_sum)
+        # The inline reduction broadcasts lane zero. Extracting with max
+        # avoids introducing another floating-point addition.
+        variance = tl.max(total_lanes, axis=0) / hidden_size
+
+        offsets = tl.arange(0, block_size)
+        mask = offsets < hidden_size
+        row_offsets = row_base + offsets
+        values = tl.load(
+            hidden_states + row_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        inverse = tl.rsqrt(variance + epsilon)
+        normalized = values * inverse
+        # LlamaRMSNorm rounds the normalized value back to the input dtype
+        # before multiplying by the learned weight. This cast is immaterial
+        # for an all-one weight, but required to reproduce the reference
+        # rounding order with real checkpoint weights.
+        normalized = normalized.to(tl.bfloat16)
+        row_weight = tl.load(weight + offsets, mask=mask, other=0.0)
+        tl.store(
+            output + row_offsets,
+            normalized * row_weight,
+            mask=mask,
+        )
+else:
+    _triton_add_rounded_square = None
+    _triton_rms_kernel = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -77,6 +220,1142 @@ def _enable_predictor() -> bool:
 def _predictor_only() -> bool:
     """Select predictor TopK once, then keep those visual tokens through every layer."""
     return _env_flag("LEARNABLE_PRUNE_PREDICTOR_ONLY", False)
+
+
+def _enable_fixed_length_greedy() -> bool:
+    """Enable the narrow, synchronization-free generation path."""
+    return _env_flag("LEARNABLE_PRUNE_FIXED_LENGTH_GREEDY", True)
+
+
+def _enable_cuda_graph_decode() -> bool:
+    """Enable the opt-in fixed-length greedy CUDA Graph decode path."""
+    return _env_flag("LEARNABLE_PRUNE_CUDA_GRAPH_DECODE", False)
+
+
+def _enable_cuda_graph_prefill() -> bool:
+    """Enable the opt-in, fixed-shape three-segment prefill graph path."""
+    return _env_flag("LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL", False)
+
+
+def _enable_static_kv_decode() -> bool:
+    """Enable the exact preallocated-cache eager decode validation path."""
+    return _env_flag("LEARNABLE_PRUNE_STATIC_KV_DECODE", False)
+
+
+def _enable_triton_rms() -> bool:
+    """Enable the opt-in, inference-only Triton RMSNorm specialization.
+
+    Long-row reductions can differ from PyTorch within one BF16 quantization
+    step, so full-checkpoint generated-token parity is required before a
+    benchmark run opts in.
+    """
+    return _env_flag("LEARNABLE_PRUNE_TRITON_RMS", False)
+
+
+def _triton_rms_norm_is_eligible(
+    norm: nn.Module,
+    hidden_states: torch.Tensor,
+) -> bool:
+    """Return whether this RMSNorm is inside the validated kernel domain."""
+    if (
+        not _enable_triton_rms()
+        or _TRITON_RMS_RUNTIME_DISABLED
+        or _triton_rms_kernel is None
+        or getattr(torch.version, "git_version", None)
+        != _TRITON_RMS_EXACT_TORCH_GIT_VERSION
+        or torch.is_grad_enabled()
+        or norm.training
+        or not isinstance(norm, LlamaRMSNorm)
+        # Bypassing Module.__call__ would also bypass benchmark/instrumentation
+        # boundaries. Preserve the authoritative module invocation whenever a
+        # caller has attached hooks.
+        or bool(norm._forward_pre_hooks)
+        or bool(norm._forward_hooks)
+        or not torch.is_tensor(hidden_states)
+        or hidden_states.ndim != 3
+        or hidden_states.shape[0] != 1
+        # Fewer than 16 rows makes PyTorch widen block.x and use a different
+        # cross-warp reduction tree (512 threads for singleton decode). Keep
+        # those shapes on the authoritative implementation; the fused
+        # one-warp-per-row tree below is exact for the prefill domain >= 16.
+        or hidden_states.shape[1] < 16
+        or hidden_states.shape[2] != 4096
+        or hidden_states.dtype != torch.bfloat16
+        or not hidden_states.is_cuda
+        or not hidden_states.is_contiguous()
+    ):
+        return False
+
+    weight = getattr(norm, "weight", None)
+    epsilon = getattr(norm, "variance_epsilon", None)
+    if (
+        not torch.is_tensor(weight)
+        or weight.ndim != 1
+        or weight.numel() != hidden_states.shape[-1]
+        or weight.dtype != hidden_states.dtype
+        or weight.device != hidden_states.device
+        or not weight.is_contiguous()
+        or isinstance(epsilon, bool)
+        or not isinstance(epsilon, (float, int))
+    ):
+        return False
+    epsilon = float(epsilon)
+    return math.isfinite(epsilon) and epsilon > 0.0
+
+
+def _launch_triton_rms_norm(
+    norm: LlamaRMSNorm,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    rows = hidden_states.numel() // hidden_states.shape[-1]
+    _triton_rms_kernel[(rows,)](
+        hidden_states,
+        norm.weight,
+        output,
+        hidden_size=4096,
+        epsilon=float(norm.variance_epsilon),
+        block_size=4096,
+        num_warps=8,
+    )
+
+
+def _apply_rms_norm(
+    norm: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Use the specialized kernel when safe, otherwise call the module."""
+    global _TRITON_RMS_RUNTIME_DISABLED
+    if bool(norm._forward_pre_hooks) or bool(norm._forward_hooks):
+        return norm(hidden_states)
+    if not _triton_rms_norm_is_eligible(norm, hidden_states):
+        return norm(hidden_states)
+
+    output = torch.empty_like(hidden_states)
+    try:
+        _launch_triton_rms_norm(norm, hidden_states, output)
+    except Exception:
+        # A missing compiler/toolchain or unsupported runtime must degrade to
+        # the authoritative implementation for this and all later calls.
+        _TRITON_RMS_RUNTIME_DISABLED = True
+        return norm(hidden_states)
+    return output
+
+
+class _HeterogeneousStaticCache(Cache):
+    """Per-layer preallocated KV storage for fixed-step batch-one decode.
+
+    LLaVA pruning leaves different prefix lengths in different decoder layers.
+    This cache preserves those physical lengths, appends a decode token at
+    ``base_length[layer] + step``, and returns a contiguous prefix so SDPA sees
+    the same layout and values as DynamicCache's ``torch.cat`` result.
+    """
+
+    def __init__(
+        self,
+        key_cache: List[torch.Tensor],
+        value_cache: List[torch.Tensor],
+        base_lengths: Tuple[int, ...],
+        max_decode_steps: int,
+    ):
+        super().__init__(layers=[])
+        if (
+            not key_cache
+            or len(key_cache) != len(value_cache)
+            or len(key_cache) != len(base_lengths)
+        ):
+            raise ValueError("Static KV cache requires matching non-empty layer lists")
+        if max_decode_steps <= 0:
+            raise ValueError("max_decode_steps must be positive")
+        self.key_cache = key_cache
+        self.value_cache = value_cache
+        self.base_lengths = tuple(int(length) for length in base_lengths)
+        self.max_decode_steps = int(max_decode_steps)
+        self._decode_step = -1
+        self._completed_steps = 0
+        self._seen_tokens = int(self.base_lengths[-1])
+
+        for layer_idx, (keys, values, base_length) in enumerate(
+            zip(self.key_cache, self.value_cache, self.base_lengths)
+        ):
+            if (
+                keys.shape != values.shape
+                or keys.ndim != 4
+                or keys.shape[0] != 1
+                or keys.shape[-2] != base_length + self.max_decode_steps
+                or keys.dtype != values.dtype
+                or keys.device != values.device
+                or not keys.is_contiguous()
+                or not values.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Invalid static KV buffers for layer {layer_idx}: "
+                    f"keys={tuple(keys.shape)}, values={tuple(values.shape)}, "
+                    f"base={base_length}, steps={self.max_decode_steps}"
+                )
+
+    @classmethod
+    def from_cache(
+        cls,
+        source: Cache,
+        max_decode_steps: int,
+    ) -> "_HeterogeneousStaticCache":
+        if not isinstance(source, Cache) or len(source) <= 0:
+            raise ValueError("A populated Transformers Cache is required")
+        base_lengths = tuple(
+            int(source.get_seq_length(layer_idx))
+            for layer_idx in range(len(source))
+        )
+        key_cache: List[torch.Tensor] = []
+        value_cache: List[torch.Tensor] = []
+        for layer_idx, base_length in enumerate(base_lengths):
+            source_keys, source_values = source[layer_idx]
+            if (
+                source_keys.shape != source_values.shape
+                or source_keys.ndim != 4
+                or source_keys.shape[0] != 1
+                or source_keys.shape[-2] != base_length
+            ):
+                raise ValueError(
+                    f"Invalid source KV tensors at layer {layer_idx}"
+                )
+            capacity = base_length + int(max_decode_steps)
+            buffer_shape = (
+                source_keys.shape[0],
+                source_keys.shape[1],
+                capacity,
+                source_keys.shape[3],
+            )
+            key_cache.append(
+                torch.empty(
+                    buffer_shape,
+                    dtype=source_keys.dtype,
+                    device=source_keys.device,
+                )
+            )
+            value_cache.append(
+                torch.empty(
+                    buffer_shape,
+                    dtype=source_values.dtype,
+                    device=source_values.device,
+                )
+            )
+        result = cls(
+            key_cache,
+            value_cache,
+            base_lengths,
+            max_decode_steps,
+        )
+        result.copy_prefill_from(source)
+        return result
+
+    def copy_prefill_from(self, source: Cache) -> None:
+        if not isinstance(source, Cache) or len(source) != len(self.key_cache):
+            raise ValueError("Source cache layer count does not match static cache")
+        for layer_idx, base_length in enumerate(self.base_lengths):
+            source_keys, source_values = source[layer_idx]
+            expected_shape = (
+                self.key_cache[layer_idx].shape[0],
+                self.key_cache[layer_idx].shape[1],
+                base_length,
+                self.key_cache[layer_idx].shape[3],
+            )
+            if (
+                tuple(source_keys.shape) != expected_shape
+                or tuple(source_values.shape) != expected_shape
+                or source_keys.dtype != self.key_cache[layer_idx].dtype
+                or source_values.dtype != self.value_cache[layer_idx].dtype
+                or source_keys.device != self.key_cache[layer_idx].device
+                or source_values.device != self.value_cache[layer_idx].device
+            ):
+                raise ValueError(
+                    f"Source cache signature changed at layer {layer_idx}"
+                )
+            self.key_cache[layer_idx][..., :base_length, :].copy_(source_keys)
+            self.value_cache[layer_idx][..., :base_length, :].copy_(source_values)
+        self._decode_step = -1
+        self._completed_steps = 0
+        self._seen_tokens = int(self.base_lengths[-1])
+
+    def set_decode_step(self, step: int) -> None:
+        step = int(step)
+        if step < 0 or step >= self.max_decode_steps:
+            raise IndexError(
+                f"Decode step {step} is outside [0, {self.max_decode_steps})"
+            )
+        self._decode_step = step
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del cache_kwargs
+        if self._decode_step < 0:
+            raise RuntimeError("set_decode_step must be called before cache update")
+        if layer_idx < 0 or layer_idx >= len(self.key_cache):
+            raise IndexError(f"Invalid cache layer index {layer_idx}")
+        target_keys = self.key_cache[layer_idx]
+        target_values = self.value_cache[layer_idx]
+        if (
+            key_states.shape != value_states.shape
+            or key_states.shape[0] != 1
+            or key_states.shape[1] != target_keys.shape[1]
+            or key_states.shape[-2] != 1
+            or key_states.shape[-1] != target_keys.shape[-1]
+            or key_states.dtype != target_keys.dtype
+            or value_states.dtype != target_values.dtype
+            or key_states.device != target_keys.device
+            or value_states.device != target_values.device
+        ):
+            raise ValueError(
+                f"Decode KV signature changed at layer {layer_idx}"
+            )
+
+        write_position = self.base_lengths[layer_idx] + self._decode_step
+        target_keys[..., write_position : write_position + 1, :].copy_(
+            key_states
+        )
+        target_values[..., write_position : write_position + 1, :].copy_(
+            value_states
+        )
+        prefix_length = write_position + 1
+        self._completed_steps = max(
+            self._completed_steps,
+            self._decode_step + 1,
+        )
+        self._seen_tokens = self.base_lengths[-1] + self._completed_steps
+        # The larger backing capacity makes the prefix view non-contiguous in
+        # the head dimension. Materialize the exact DynamicCache layout; under
+        # CUDA Graph replay these copies carry no per-kernel Python launches.
+        return (
+            target_keys[..., :prefix_length, :].contiguous(),
+            target_values[..., :prefix_length, :].contiguous(),
+        )
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx < 0 or layer_idx >= len(self.base_lengths):
+            return 0
+        return self.base_lengths[layer_idx] + self._completed_steps
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        if layer_idx < 0 or layer_idx >= len(self.base_lengths):
+            return 0
+        return self.base_lengths[layer_idx] + self.max_decode_steps
+
+    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if layer_idx < 0 or layer_idx >= len(self.key_cache):
+            raise KeyError(layer_idx)
+        length = self.get_seq_length(layer_idx)
+        return (
+            self.key_cache[layer_idx][..., :length, :],
+            self.value_cache[layer_idx][..., :length, :],
+        )
+
+    def __len__(self) -> int:
+        return len(self.key_cache)
+
+
+class _FixedGreedyCudaGraphRunner:
+    """Step-specific CUDA Graphs over an exact heterogeneous static KV cache."""
+
+    def __init__(
+        self,
+        model: Any,
+        source_cache: Cache,
+        *,
+        max_new_tokens: int,
+        original_sequence_length: int,
+        eos_token_ids: Tuple[int, ...],
+        first_token: torch.Tensor,
+    ):
+        if max_new_tokens <= 1:
+            raise ValueError("CUDA Graph decode requires at least one decode step")
+        if not first_token.is_cuda or first_token.shape != (1,):
+            raise ValueError("CUDA Graph decode requires one CUDA token")
+        self.model = model
+        self.max_new_tokens = int(max_new_tokens)
+        self.decode_steps = self.max_new_tokens - 1
+        self.original_sequence_length = int(original_sequence_length)
+        self.eos_token_ids = tuple(int(token_id) for token_id in eos_token_ids)
+        self.device = first_token.device
+        self.cache = _HeterogeneousStaticCache.from_cache(
+            source_cache,
+            max_decode_steps=self.decode_steps,
+        )
+        self.source_signature = self.cache_signature(source_cache)
+        self.token_buffer = torch.empty(
+            (1, 1),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.generated_tokens = torch.empty(
+            (1, self.max_new_tokens),
+            dtype=torch.long,
+            device=self.device,
+        )
+        final_cache_length = int(self.cache.base_lengths[-1])
+        self.rope_positions = torch.arange(
+            self.original_sequence_length,
+            self.original_sequence_length + self.decode_steps,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.physical_cache_positions = torch.arange(
+            final_cache_length,
+            final_cache_length + self.decode_steps,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.prefix_graphs: List[torch.cuda.CUDAGraph] = []
+        self.decoder_graphs: List[torch.cuda.CUDAGraph] = []
+        # Retain graph outputs that bridge separately captured graph segments.
+        self._step_hidden_inputs: List[torch.Tensor] = []
+        self._step_position_embeddings: List[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = []
+        self._step_logits: List[torch.Tensor] = []
+        self._warm_and_capture(source_cache, first_token)
+
+    @staticmethod
+    def cache_signature(source_cache: Cache) -> Tuple[Any, ...]:
+        if not isinstance(source_cache, Cache) or len(source_cache) <= 0:
+            raise ValueError("A populated Transformers Cache is required")
+        signature = []
+        for layer_idx in range(len(source_cache)):
+            keys, values = source_cache[layer_idx]
+            signature.append(
+                (
+                    tuple(keys.shape),
+                    tuple(values.shape),
+                    keys.dtype,
+                    values.dtype,
+                    keys.device.type,
+                    keys.device.index,
+                    values.device.type,
+                    values.device.index,
+                )
+            )
+        return tuple(signature)
+
+    def _copy_inputs(
+        self,
+        source_cache: Cache,
+        first_token: torch.Tensor,
+    ) -> None:
+        if self.cache_signature(source_cache) != self.source_signature:
+            raise ValueError("CUDA Graph prefill cache signature changed")
+        if (
+            first_token.shape != (1,)
+            or first_token.dtype != torch.long
+            or first_token.device != self.device
+        ):
+            raise ValueError("CUDA Graph first-token signature changed")
+        self.cache.copy_prefill_from(source_cache)
+        self.token_buffer.copy_(first_token.unsqueeze(1))
+        self.generated_tokens[:, 0].copy_(first_token)
+
+    def _prefix_body(
+        self,
+        step: int,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        token_embeds = self.model.get_model().embed_tokens(self.token_buffer)
+        position_ids = self.rope_positions[step : step + 1].unsqueeze(0)
+        position_embeddings = self.model.model.rotary_emb(
+            token_embeds,
+            position_ids,
+        )
+        return token_embeds, position_embeddings
+
+    def _decoder_body(
+        self,
+        step: int,
+        cache: _HeterogeneousStaticCache,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        position_ids = self.rope_positions[step : step + 1].unsqueeze(0)
+        cache_position = self.physical_cache_positions[step : step + 1]
+        for layer in self.model.model.layers:
+            hidden_states, _, _ = self.model._run_layer(
+                layer,
+                hidden_states,
+                None,
+                position_ids,
+                past_key_value=cache,
+                use_cache=True,
+                output_attentions=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+        hidden_states = _apply_rms_norm(
+            self.model.model.norm,
+            hidden_states,
+        )
+        return self.model.lm_head(hidden_states[:, -1:, :])[:, -1, :]
+
+    def _postfix_body(self, step: int, logits: torch.Tensor) -> None:
+        next_token = self.model._fixed_length_greedy_next_token(
+            logits,
+            self.eos_token_ids,
+        )
+        self.token_buffer.copy_(next_token.unsqueeze(1))
+        self.generated_tokens[:, step + 1].copy_(next_token)
+
+    def _warm_and_capture(
+        self,
+        source_cache: Cache,
+        first_token: torch.Tensor,
+    ) -> None:
+        current_stream = torch.cuda.current_stream(self.device)
+        warm_cache = _HeterogeneousStaticCache.from_cache(
+            source_cache,
+            max_decode_steps=self.decode_steps,
+        )
+        self.token_buffer.copy_(first_token.unsqueeze(1))
+        warm_stream = torch.cuda.Stream(device=self.device)
+        warm_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warm_stream):
+            for step in range(self.decode_steps):
+                warm_cache.set_decode_step(step)
+                hidden_states, position_embeddings = self._prefix_body(step)
+                logits = self._decoder_body(
+                    step,
+                    warm_cache,
+                    hidden_states,
+                    position_embeddings,
+                )
+                self._postfix_body(step, logits)
+        current_stream.wait_stream(warm_stream)
+
+        self._copy_inputs(source_cache, first_token)
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.device(self.device):
+            pool = torch.cuda.graph_pool_handle()
+            for step in range(self.decode_steps):
+                prefix_graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(
+                        prefix_graph,
+                        pool=pool,
+                        stream=capture_stream,
+                    ):
+                        hidden_states, position_embeddings = self._prefix_body(
+                            step
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"prefix graph capture failed at decode step {step}: "
+                        f"{exc!r}"
+                    ) from exc
+                self.prefix_graphs.append(prefix_graph)
+                self._step_hidden_inputs.append(hidden_states)
+                self._step_position_embeddings.append(position_embeddings)
+
+                self.cache.set_decode_step(step)
+                decoder_graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(
+                        decoder_graph,
+                        pool=pool,
+                        stream=capture_stream,
+                    ):
+                        logits = self._decoder_body(
+                            step,
+                            self.cache,
+                            hidden_states,
+                            position_embeddings,
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"decoder graph capture failed at decode step {step}: "
+                        f"{exc!r}"
+                    ) from exc
+                self.decoder_graphs.append(decoder_graph)
+                self._step_logits.append(logits)
+        current_stream.wait_stream(capture_stream)
+
+    def run(
+        self,
+        source_cache: Cache,
+        first_token: torch.Tensor,
+    ) -> torch.Tensor:
+        self._copy_inputs(source_cache, first_token)
+        for step, (prefix_graph, decoder_graph, logits) in enumerate(
+            zip(
+                self.prefix_graphs,
+                self.decoder_graphs,
+                self._step_logits,
+            ),
+            start=1,
+        ):
+            prefix_graph.replay()
+            self.model._emit_cuda_graph_decode_boundary(
+                "decode_start",
+                step,
+            )
+            decoder_graph.replay()
+            self.model._emit_cuda_graph_decode_boundary(
+                "decode_end",
+                step,
+            )
+            # Advanced-index EOS masking is not graph-safe on the target
+            # stack. Keep this tiny suffix eager; it executes after the formal
+            # lm_head boundary and updates the shared token input before the
+            # next prefix graph replay.
+            self._postfix_body(step - 1, logits)
+        return self.generated_tokens.clone()
+
+
+class _CudaGraphPrefillBoundaryCallbackError(RuntimeError):
+    """Keep instrumentation failures distinct from decoder replay failures."""
+
+
+class _DecoderPrefillCudaGraphSegment:
+    """One fixed-shape contiguous decoder segment captured as a CUDA Graph.
+
+    Token selection is deliberately outside this class. The caller copies the
+    exact eager-selected hidden states and original RoPE positions into static
+    buffers, then replays only the authoritative decoder-layer operations.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        start_layer: int,
+        end_layer: int,
+        example_hidden_states: torch.Tensor,
+        example_position_ids: torch.Tensor,
+        normalize_and_project: bool,
+    ):
+        if (
+            not example_hidden_states.is_cuda
+            or example_hidden_states.ndim != 3
+            or example_hidden_states.shape[0] != 1
+            or example_hidden_states.dtype
+            not in {torch.bfloat16, torch.float16}
+            or not example_hidden_states.is_contiguous()
+            or not example_position_ids.is_cuda
+            or example_position_ids.ndim != 2
+            or example_position_ids.shape
+            != example_hidden_states.shape[:2]
+            or example_position_ids.dtype != torch.long
+            or example_position_ids.device != example_hidden_states.device
+            or not example_position_ids.is_contiguous()
+        ):
+            raise ValueError("Invalid fixed-shape prefill graph inputs")
+        if not (
+            0 <= int(start_layer) < int(end_layer) <= len(model.model.layers)
+        ):
+            raise ValueError(
+                f"Invalid prefill graph segment [{start_layer}, {end_layer})"
+            )
+
+        self.model = model
+        self.start_layer = int(start_layer)
+        self.end_layer = int(end_layer)
+        self.normalize_and_project = bool(normalize_and_project)
+        self.device = example_hidden_states.device
+        self.hidden_signature = (
+            tuple(example_hidden_states.shape),
+            example_hidden_states.dtype,
+            example_hidden_states.device.type,
+            example_hidden_states.device.index,
+        )
+        self.position_signature = (
+            tuple(example_position_ids.shape),
+            example_position_ids.dtype,
+            example_position_ids.device.type,
+            example_position_ids.device.index,
+        )
+        self.static_hidden_states = torch.empty_like(example_hidden_states)
+        self.static_position_ids = torch.empty_like(example_position_ids)
+        self.static_hidden_states.copy_(example_hidden_states)
+        self.static_position_ids.copy_(example_position_ids)
+
+        # Warm allocator, GEMM, SDPA, RoPE, and optional exact Triton RMS
+        # specializations on a side stream before capture. Construction occurs
+        # only on an uninstrumented cache miss and is disclosed separately from
+        # steady-state replay latency.
+        torch.cuda.synchronize(self.device)
+        current_stream = torch.cuda.current_stream(self.device)
+        warm_stream = torch.cuda.Stream(device=self.device)
+        warm_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warm_stream):
+            for _ in range(3):
+                self._body()
+        current_stream.wait_stream(warm_stream)
+        torch.cuda.synchronize(self.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(current_stream)
+        capture_start = time.perf_counter()
+        with torch.cuda.graph(
+            self.graph,
+            stream=capture_stream,
+            capture_error_mode="thread_local",
+        ):
+            (
+                self.output_hidden_states,
+                self.output_cache,
+                self.output_logits,
+            ) = self._body()
+        current_stream.wait_stream(capture_stream)
+        torch.cuda.synchronize(self.device)
+        self.capture_wall_ms = (
+            time.perf_counter() - capture_start
+        ) * 1000.0
+
+    def _body(
+        self,
+    ) -> Tuple[torch.Tensor, DynamicCache, Optional[torch.Tensor]]:
+        hidden_states = self.static_hidden_states
+        position_ids = self.static_position_ids
+        cache_position = torch.arange(
+            hidden_states.shape[1],
+            device=hidden_states.device,
+            dtype=torch.long,
+        )
+        position_embeddings = self.model.model.rotary_emb(
+            hidden_states,
+            position_ids,
+        )
+        cache = DynamicCache(config=self.model.model.config)
+        for layer_idx in range(self.start_layer, self.end_layer):
+            hidden_states, _, _ = self.model._run_layer(
+                self.model.model.layers[layer_idx],
+                hidden_states,
+                None,
+                position_ids,
+                past_key_value=cache,
+                use_cache=True,
+                output_attentions=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+        logits = None
+        if self.normalize_and_project:
+            hidden_states = _apply_rms_norm(
+                self.model.model.norm,
+                hidden_states,
+            )
+            logits = self.model.lm_head(hidden_states[:, -1:, :])
+        return hidden_states, cache, logits
+
+    def run(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, DynamicCache, Optional[torch.Tensor]]:
+        hidden_signature = (
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+            hidden_states.device.type,
+            hidden_states.device.index,
+        )
+        position_signature = (
+            tuple(position_ids.shape),
+            position_ids.dtype,
+            position_ids.device.type,
+            position_ids.device.index,
+        )
+        if (
+            hidden_signature != self.hidden_signature
+            or position_signature != self.position_signature
+            or not hidden_states.is_contiguous()
+            or not position_ids.is_contiguous()
+        ):
+            raise ValueError(
+                "CUDA Graph prefill segment signature changed: "
+                f"hidden={hidden_signature}, position={position_signature}"
+            )
+        self.static_hidden_states.copy_(hidden_states)
+        self.static_position_ids.copy_(position_ids)
+        self.graph.replay()
+        return (
+            self.output_hidden_states,
+            self.output_cache,
+            self.output_logits,
+        )
+
+
+class _ThreeSegmentPrefillCudaGraphRunner:
+    """Exact early/middle/late decoder graphs around eager token selection."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        scoped_hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+        mid_pruning_layer_idx: int,
+        mid_scoring_layer_idx: int,
+        wipe_layer_idx: int,
+        mid_attn_anchor: str,
+        mid_target_count: int,
+        runner_id: int,
+    ):
+        initialization_start = time.perf_counter()
+        self.model = model
+        self.runner_id = int(runner_id)
+        self.mid_pruning_layer_idx = int(mid_pruning_layer_idx)
+        self.mid_scoring_layer_idx = int(mid_scoring_layer_idx)
+        self.wipe_layer_idx = int(wipe_layer_idx)
+        self.mid_attn_anchor = str(mid_attn_anchor)
+        self.mid_target_count = int(mid_target_count)
+        self.replay_count = 0
+        num_layers = len(model.model.layers)
+        if not (
+            0 < self.mid_pruning_layer_idx
+            < self.wipe_layer_idx
+            < num_layers
+        ):
+            raise ValueError(
+                "Prefill CUDA Graph requires three non-empty decoder segments"
+            )
+
+        self.early = _DecoderPrefillCudaGraphSegment(
+            model,
+            start_layer=0,
+            end_layer=self.mid_pruning_layer_idx,
+            example_hidden_states=scoped_hidden_states,
+            example_position_ids=scoped_position_ids,
+            normalize_and_project=False,
+        )
+        early_hidden, _, _ = self.early.run(
+            scoped_hidden_states,
+            scoped_position_ids,
+        )
+        (
+            mid_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            mid_keep_positions,
+            _,
+            _,
+        ) = self._middle_prune(
+            early_hidden,
+            scoped_input_ids,
+            scoped_attention_mask,
+            scoped_position_ids,
+        )
+        self.middle = _DecoderPrefillCudaGraphSegment(
+            model,
+            start_layer=self.mid_pruning_layer_idx,
+            end_layer=self.wipe_layer_idx,
+            example_hidden_states=mid_hidden,
+            example_position_ids=mid_position_ids,
+            normalize_and_project=False,
+        )
+        middle_hidden, _, _ = self.middle.run(
+            mid_hidden,
+            mid_position_ids,
+        )
+        (
+            late_hidden,
+            _,
+            _,
+            late_position_ids,
+            _,
+            _,
+        ) = self._final_wipe(
+            middle_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            scoped_keep_positions,
+            mid_keep_positions,
+        )
+        self.late = _DecoderPrefillCudaGraphSegment(
+            model,
+            start_layer=self.wipe_layer_idx,
+            end_layer=num_layers,
+            example_hidden_states=late_hidden,
+            example_position_ids=late_position_ids,
+            normalize_and_project=True,
+        )
+        self.late.run(late_hidden, late_position_ids)
+        torch.cuda.synchronize(scoped_hidden_states.device)
+        self.segment_shapes = (
+            int(scoped_hidden_states.shape[1]),
+            int(mid_hidden.shape[1]),
+            int(late_hidden.shape[1]),
+        )
+        self.capture_wall_ms = sum(
+            segment.capture_wall_ms
+            for segment in (self.early, self.middle, self.late)
+        )
+        self.initialization_wall_ms = (
+            time.perf_counter() - initialization_start
+        ) * 1000.0
+
+    def _middle_prune(
+        self,
+        hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+    ]:
+        # These are deliberately the authoritative eager selection methods.
+        # No graph-specific approximation is allowed in TopK, tie-breaking,
+        # sorting, query anchoring, or packed-index construction.
+        visual_positions = scoped_input_ids[0].eq(
+            IMAGE_TOKEN_INDEX
+        ).nonzero(as_tuple=False).flatten()
+        query_indices = self.model._build_mid_query_indices(
+            input_ids=scoped_input_ids,
+            attention_mask=scoped_attention_mask,
+            visual_positions=visual_positions,
+            attn_anchor=self.mid_attn_anchor,
+        )
+        if visual_positions.numel() > 0:
+            importance_scores = (
+                self.model._get_visual_token_attention_scores(
+                    hidden_states=hidden_states,
+                    attention_mask=scoped_attention_mask,
+                    position_ids=scoped_position_ids,
+                    scoring_layer_idx=self.mid_scoring_layer_idx,
+                    visual_positions=visual_positions,
+                    query_indices=query_indices,
+                ).mean(dim=0)
+            )
+        else:
+            importance_scores = hidden_states.new_zeros((0,))
+        (
+            mid_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            mid_keep_positions,
+        ) = self.model._prune_by_mid_attention_scores(
+            hidden_states=hidden_states,
+            input_ids=scoped_input_ids,
+            attention_mask=scoped_attention_mask,
+            position_ids=scoped_position_ids,
+            importance_scores=importance_scores,
+            target_count=self.mid_target_count,
+        )
+        return (
+            mid_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            mid_keep_positions,
+            int(query_indices.numel()),
+            int(
+                min(
+                    max(self.mid_target_count, 0),
+                    int(visual_positions.numel()),
+                )
+            ),
+        )
+
+    def _final_wipe(
+        self,
+        hidden_states: torch.Tensor,
+        mid_input_ids: torch.Tensor,
+        mid_attention_mask: torch.Tensor,
+        mid_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+        mid_keep_positions: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        (
+            late_hidden,
+            final_input_ids,
+            final_attention_mask,
+            final_position_ids,
+            wiped_keep_positions,
+        ) = self.model._wipe_visual_tokens(
+            hidden_states=hidden_states,
+            input_ids=mid_input_ids,
+            attention_mask=mid_attention_mask,
+            position_ids=mid_position_ids,
+        )
+        scoped_keep_positions = scoped_keep_positions.to(
+            device=mid_keep_positions.device
+        )
+        mid_keep_in_original = scoped_keep_positions.index_select(
+            1,
+            mid_keep_positions[0],
+        )
+        mid_keep_in_original = mid_keep_in_original.to(
+            device=wiped_keep_positions.device
+        )
+        final_keep_positions = mid_keep_in_original.index_select(
+            1,
+            wiped_keep_positions[0],
+        )
+        final_wiped_visual_tokens = int(
+            mid_attention_mask.shape[1] - final_attention_mask.shape[1]
+        )
+        return (
+            late_hidden,
+            final_input_ids,
+            final_attention_mask,
+            final_position_ids,
+            final_keep_positions,
+            final_wiped_visual_tokens,
+        )
+
+    @staticmethod
+    def _attach_cache_layer(
+        target: DynamicCache,
+        layer_idx: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        layer = target.layers[layer_idx]
+        layer.keys = keys
+        layer.values = values
+        layer.dtype = keys.dtype
+        layer.device = keys.device
+        layer.is_initialized = True
+
+    def _combine_caches(
+        self,
+        early_cache: DynamicCache,
+        middle_cache: DynamicCache,
+        late_cache: DynamicCache,
+    ) -> DynamicCache:
+        combined = DynamicCache(config=self.model.model.config)
+        for layer_idx in range(len(self.model.model.layers)):
+            if layer_idx < self.mid_pruning_layer_idx:
+                source = early_cache
+            elif layer_idx < self.wipe_layer_idx:
+                source = middle_cache
+            else:
+                source = late_cache
+            keys, values = source[layer_idx]
+            self._attach_cache_layer(
+                combined,
+                layer_idx,
+                keys,
+                values,
+            )
+        return combined
+
+    def run(
+        self,
+        *,
+        scoped_hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        DynamicCache,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        int,
+    ]:
+        self.model._emit_cuda_graph_prefill_boundary(
+            "prefill_start",
+            self.runner_id,
+        )
+        early_hidden, early_cache, _ = self.early.run(
+            scoped_hidden_states,
+            scoped_position_ids,
+        )
+        (
+            mid_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            mid_keep_positions,
+            mid_query_count,
+            mid_visual_tokens,
+        ) = self._middle_prune(
+            early_hidden,
+            scoped_input_ids,
+            scoped_attention_mask,
+            scoped_position_ids,
+        )
+        middle_hidden, middle_cache, _ = self.middle.run(
+            mid_hidden,
+            mid_position_ids,
+        )
+        (
+            late_hidden,
+            final_input_ids,
+            final_attention_mask,
+            final_position_ids,
+            final_keep_positions,
+            final_wiped_visual_tokens,
+        ) = self._final_wipe(
+            middle_hidden,
+            mid_input_ids,
+            mid_attention_mask,
+            mid_position_ids,
+            scoped_keep_positions,
+            mid_keep_positions,
+        )
+        final_hidden, late_cache, logits = self.late.run(
+            late_hidden,
+            final_position_ids,
+        )
+        if logits is None:
+            raise RuntimeError("Prefill CUDA Graph did not capture LM-head output")
+        combined_cache = self._combine_caches(
+            early_cache,
+            middle_cache,
+            late_cache,
+        )
+        self.model._set_cache_seen_tokens(
+            combined_cache,
+            int(final_hidden.shape[1]),
+        )
+        # End means both the first-token logits and the heterogeneous prefill
+        # cache consumed by the next decode step are ready.
+        self.model._emit_cuda_graph_prefill_boundary(
+            "prefill_end",
+            self.runner_id,
+        )
+        self.replay_count += 1
+        return (
+            final_hidden,
+            combined_cache,
+            logits,
+            final_input_ids,
+            final_attention_mask,
+            final_keep_positions,
+            mid_query_count,
+            mid_visual_tokens,
+            int(
+                scoped_attention_mask.shape[1]
+                - mid_attention_mask.shape[1]
+            ),
+            final_wiped_visual_tokens,
+        )
 
 
 def _mid_target_count(default: Optional[int] = None) -> int:
@@ -334,10 +1613,142 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self._scope_finalwipe_applied = False
         self._scope_finalwipe_next_position_id = None
+        self._cuda_graph_decode_boundary_callbacks: "OrderedDict[int, Callable[[str, int], None]]" = (
+            OrderedDict()
+        )
+        self._fixed_greedy_cuda_graph_runners: "OrderedDict[Tuple[Any, ...], Any]" = (
+            OrderedDict()
+        )
+        self._cuda_graph_prefill_boundary_callbacks: "OrderedDict[int, Callable[[str, int], None]]" = (
+            OrderedDict()
+        )
+        self._prefill_cuda_graph_runners: "OrderedDict[Tuple[Any, ...], Any]" = (
+            OrderedDict()
+        )
+        self._cuda_graph_prefill_runner_sequence = 0
+        self._cuda_graph_prefill_logits: Optional[torch.Tensor] = None
+        self._cuda_graph_prefill_counters: Dict[str, Any] = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "captures": 0,
+            "capture_failures": 0,
+            "replay_successes": 0,
+            "replay_failures": 0,
+            "eager_fallbacks": 0,
+            "hook_fallbacks": 0,
+            "signature_mismatches": 0,
+            "evictions": 0,
+            "total_capture_wall_ms": 0.0,
+            "total_initialization_wall_ms": 0.0,
+            "last_status": "never_attempted",
+            "last_runner_id": None,
+            "last_error": None,
+        }
         self.post_init()
 
     def get_model(self):
         return self.model
+
+    def register_cuda_graph_decode_boundary_callback(
+        self,
+        callback: Callable[[str, int], None],
+    ) -> RemovableHandle:
+        """Register replay-only decode boundary instrumentation.
+
+        The callback receives ``("decode_start", step)`` immediately before a
+        decoder graph replay is enqueued and ``("decode_end", step)``
+        immediately after. Steps start at one because token zero is produced by
+        prefill, which has its own replay-boundary callback when its graph is
+        active.
+        """
+        if not callable(callback):
+            raise TypeError("CUDA Graph decode boundary callback must be callable")
+        handle = RemovableHandle(self._cuda_graph_decode_boundary_callbacks)
+        self._cuda_graph_decode_boundary_callbacks[handle.id] = callback
+        return handle
+
+    def _emit_cuda_graph_decode_boundary(self, phase: str, step: int) -> None:
+        if phase not in {"decode_start", "decode_end"}:
+            raise ValueError(f"Unknown CUDA Graph decode phase: {phase}")
+        for callback in tuple(
+            self._cuda_graph_decode_boundary_callbacks.values()
+        ):
+            callback(phase, int(step))
+
+    def register_cuda_graph_prefill_boundary_callback(
+        self,
+        callback: Callable[[str, int], None],
+    ) -> RemovableHandle:
+        """Register exact steady-state prefill graph replay boundaries.
+
+        The callback receives ``("prefill_start", runner_id)`` immediately
+        before the early segment's required static-buffer copies/replay, after
+        vision/projector and eager predictor/SCOPE selection. It receives
+        ``("prefill_end", runner_id)`` immediately after the late graph,
+        which includes final RMSNorm and the last-token LM head. Authoritative
+        eager middle scoring/TopK/sort/packing and the final wipe execute
+        between these boundaries.
+
+        Capture/warmup never emits callbacks. A callback-aware call requires a
+        previously warmed cache hit; cache miss or replay failure is raised
+        rather than hidden by eager fallback.
+        """
+        if not callable(callback):
+            raise TypeError("CUDA Graph prefill boundary callback must be callable")
+        handle = RemovableHandle(self._cuda_graph_prefill_boundary_callbacks)
+        self._cuda_graph_prefill_boundary_callbacks[handle.id] = callback
+        return handle
+
+    def _emit_cuda_graph_prefill_boundary(
+        self,
+        phase: str,
+        runner_id: int,
+    ) -> None:
+        if phase not in {"prefill_start", "prefill_end"}:
+            raise ValueError(f"Unknown CUDA Graph prefill phase: {phase}")
+        for callback in tuple(
+            self._cuda_graph_prefill_boundary_callbacks.values()
+        ):
+            try:
+                callback(phase, int(runner_id))
+            except Exception as exc:
+                raise _CudaGraphPrefillBoundaryCallbackError(
+                    "CUDA Graph prefill boundary callback failed: "
+                    f"phase={phase}, runner_id={int(runner_id)}"
+                ) from exc
+
+    def get_cuda_graph_prefill_diagnostics(self) -> Dict[str, Any]:
+        """Return JSON-friendly cache/capture/replay evidence."""
+        runners = []
+        cached_failures = 0
+        for cached in self._prefill_cuda_graph_runners.values():
+            if isinstance(cached, _ThreeSegmentPrefillCudaGraphRunner):
+                runners.append(
+                    {
+                        "runner_id": int(cached.runner_id),
+                        "segment_shapes": [
+                            int(value) for value in cached.segment_shapes
+                        ],
+                        "capture_wall_ms": float(cached.capture_wall_ms),
+                        "initialization_wall_ms": float(
+                            cached.initialization_wall_ms
+                        ),
+                        "replay_count": int(cached.replay_count),
+                    }
+                )
+            elif isinstance(cached, Exception):
+                cached_failures += 1
+        return {
+            "enabled": bool(_enable_cuda_graph_prefill()),
+            "cache_capacity": max(
+                0,
+                _env_int("LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL_CACHE_SIZE", 2),
+            ),
+            "cache_entries": len(self._prefill_cuda_graph_runners),
+            "cached_failures": int(cached_failures),
+            "runners": runners,
+            **dict(self._cuda_graph_prefill_counters),
+        }
 
     def _device_dtype(self) -> Tuple[torch.device, torch.dtype]:
         param = next(self.parameters())
@@ -877,7 +2288,10 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         position_ids = position_ids.to(device=layer_device)
         visual_positions = visual_positions.to(dtype=torch.long, device=layer_device)
         query_indices = query_indices.to(dtype=torch.long, device=layer_device)
-        hidden_normed = scoring_layer.input_layernorm(hidden_states)
+        hidden_normed = _apply_rms_norm(
+            scoring_layer.input_layernorm,
+            hidden_states,
+        )
         num_heads = getattr(self_attn.config, "num_attention_heads", None)
         if num_heads is None:
             num_heads = getattr(self_attn, "num_heads")
@@ -1031,7 +2445,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             and not output_attentions
         ):
             residual = hidden_states
-            normed = layer.input_layernorm(hidden_states)
+            normed = _apply_rms_norm(layer.input_layernorm, hidden_states)
             self_attn = layer.self_attn
             bsz, query_len, _ = normed.shape
             head_dim = int(self_attn.head_dim)
@@ -1061,7 +2475,9 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             attn_output = attn_output.transpose(1, 2).reshape(bsz, query_len, -1).contiguous()
             hidden_states = residual + self_attn.o_proj(attn_output)
             residual = hidden_states
-            hidden_states = residual + layer.mlp(layer.post_attention_layernorm(hidden_states))
+            hidden_states = residual + layer.mlp(
+                _apply_rms_norm(layer.post_attention_layernorm, hidden_states)
+            )
             return hidden_states, None, None
         outputs = layer(
             hidden_states,
@@ -1129,10 +2545,393 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             if output_attentions:
                 all_attns = all_attns + (attn,)
 
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states = _apply_rms_norm(self.model.norm, hidden_states)
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         return hidden_states, (tuple(next_cache) if isinstance(next_cache, list) else next_cache), all_hidden_states, all_attns
+
+    def _decoder_prefill_has_forward_hooks(self) -> bool:
+        modules: List[nn.Module] = [self.lm_head, self.model.norm]
+        rotary_emb = getattr(self.model, "rotary_emb", None)
+        if isinstance(rotary_emb, nn.Module):
+            modules.extend(rotary_emb.modules())
+        for layer in self.model.layers:
+            modules.extend(layer.modules())
+        return any(
+            bool(module._forward_pre_hooks) or bool(module._forward_hooks)
+            for module in modules
+        )
+
+    def _cuda_graph_prefill_ineligibility(
+        self,
+        *,
+        scoped_hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        capture_last_logit: bool,
+        predictor_only: bool,
+        enable_finalwipe: bool,
+        mid_pruning_layer_idx: int,
+        wipe_layer_idx: int,
+        scoped_visual_tokens: int,
+    ) -> Optional[str]:
+        if not _enable_cuda_graph_prefill():
+            return "disabled"
+        # CUDA Graph outputs alias fixed replay buffers. Restrict them to the
+        # private fixed-length generation loop, which consumes logits/cache
+        # completely before returning only generated token IDs. Public forward
+        # calls retain ordinary non-aliasing eager semantics.
+        if _CUDA_GRAPH_PREFILL_GENERATION_OWNER.get() != id(self):
+            return "outside_fixed_length_greedy_generate"
+        if (
+            max(
+                0,
+                _env_int(
+                    "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL_CACHE_SIZE",
+                    2,
+                ),
+            )
+            <= 0
+        ):
+            return "zero_cache_capacity"
+        if self.training or torch.is_grad_enabled():
+            return "training_or_grad_enabled"
+        if not use_cache or output_attentions or output_hidden_states:
+            return "unsupported_output_or_cache_request"
+        if not capture_last_logit:
+            return "request_does_not_select_only_last_logit"
+        if predictor_only or not enable_finalwipe:
+            return "three_stage_pruning_not_active"
+        if _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False):
+            return "internal_event_profiler_active"
+        if (
+            str(getattr(self.model.config, "_attn_implementation", "eager"))
+            != "sdpa"
+            or not _env_flag("LEARNABLE_PRUNE_DIRECT_SDPA", True)
+            or not _env_flag("LEARNABLE_PRUNE_IMPLICIT_CAUSAL", False)
+        ):
+            return "requires_direct_sdpa_with_implicit_causal"
+        if not torch.cuda.is_available() or not scoped_hidden_states.is_cuda:
+            return "non_cuda_input"
+        if torch.cuda.is_current_stream_capturing():
+            return "already_inside_cuda_capture"
+        if not (
+            0 < int(mid_pruning_layer_idx)
+            < int(wipe_layer_idx)
+            < len(self.model.layers)
+        ):
+            return "three_nonempty_segments_required"
+        if not (
+            0
+            <= int(scoped_visual_tokens)
+            <= int(scoped_hidden_states.shape[1])
+        ):
+            return "missing_scoped_visual_token_count"
+        tensors = (
+            scoped_hidden_states,
+            scoped_input_ids,
+            scoped_attention_mask,
+            scoped_position_ids,
+            scoped_keep_positions,
+        )
+        if any(
+            not torch.is_tensor(tensor)
+            or not tensor.is_cuda
+            or tensor.device != scoped_hidden_states.device
+            for tensor in tensors
+        ):
+            return "mixed_or_invalid_tensor_devices"
+        if (
+            scoped_hidden_states.ndim != 3
+            or scoped_hidden_states.shape[0] != 1
+            or scoped_hidden_states.dtype
+            not in {torch.bfloat16, torch.float16}
+            or not scoped_hidden_states.is_contiguous()
+            or scoped_input_ids.ndim != 2
+            or scoped_input_ids.shape != scoped_hidden_states.shape[:2]
+            or scoped_input_ids.dtype != torch.long
+            or not scoped_input_ids.is_contiguous()
+            or scoped_attention_mask.ndim != 2
+            or scoped_attention_mask.shape != scoped_hidden_states.shape[:2]
+            or not scoped_attention_mask.is_contiguous()
+            or scoped_position_ids.ndim != 2
+            or scoped_position_ids.shape != scoped_hidden_states.shape[:2]
+            or scoped_position_ids.dtype != torch.long
+            or not scoped_position_ids.is_contiguous()
+            or scoped_keep_positions.ndim != 2
+            or scoped_keep_positions.shape
+            != scoped_hidden_states.shape[:2]
+            or scoped_keep_positions.dtype != torch.long
+            or not scoped_keep_positions.is_contiguous()
+        ):
+            return "unsupported_tensor_signature"
+        return None
+
+    def _cuda_graph_prefill_cache_key(
+        self,
+        *,
+        scoped_hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+        mid_pruning_layer_idx: int,
+        mid_scoring_layer_idx: int,
+        wipe_layer_idx: int,
+        mid_attn_anchor: str,
+        mid_target_count: int,
+        scoped_visual_tokens: int,
+    ) -> Tuple[Any, ...]:
+        def signature(tensor: torch.Tensor) -> Tuple[Any, ...]:
+            return (
+                tuple(tensor.shape),
+                tensor.dtype,
+                tensor.device.type,
+                tensor.device.index,
+            )
+
+        scoped_tokens = int(scoped_hidden_states.shape[1])
+        scoped_visual_tokens = int(scoped_visual_tokens)
+        mid_visual_tokens = min(
+            max(int(mid_target_count), 0),
+            scoped_visual_tokens,
+        )
+        segment_shapes = (
+            scoped_tokens,
+            scoped_tokens - scoped_visual_tokens + mid_visual_tokens,
+            scoped_tokens - scoped_visual_tokens,
+        )
+
+        return (
+            signature(scoped_hidden_states),
+            signature(scoped_input_ids),
+            signature(scoped_attention_mask),
+            signature(scoped_position_ids),
+            signature(scoped_keep_positions),
+            segment_shapes,
+            scoped_visual_tokens,
+            int(mid_pruning_layer_idx),
+            int(mid_scoring_layer_idx),
+            int(wipe_layer_idx),
+            str(mid_attn_anchor),
+            int(mid_target_count),
+            len(self.model.layers),
+            int(self.config.hidden_size),
+            int(self.vocab_size),
+            bool(_enable_triton_rms()),
+            bool(_TRITON_RMS_RUNTIME_DISABLED),
+            getattr(torch.version, "git_version", None),
+            str(getattr(self.model.config, "_attn_implementation", "eager")),
+            bool(_env_flag("LEARNABLE_PRUNE_DIRECT_SDPA", True)),
+            bool(_env_flag("LEARNABLE_PRUNE_IMPLICIT_CAUSAL", False)),
+        )
+
+    def _try_cuda_graph_prefill(
+        self,
+        *,
+        scoped_hidden_states: torch.Tensor,
+        scoped_input_ids: torch.Tensor,
+        scoped_attention_mask: torch.Tensor,
+        scoped_position_ids: torch.Tensor,
+        scoped_keep_positions: torch.Tensor,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        capture_last_logit: bool,
+        predictor_only: bool,
+        enable_finalwipe: bool,
+        mid_pruning_layer_idx: int,
+        mid_scoring_layer_idx: int,
+        wipe_layer_idx: int,
+        mid_attn_anchor: str,
+        mid_target_count: int,
+        scoped_visual_tokens: int,
+    ) -> Optional[Tuple[Any, ...]]:
+        counters = self._cuda_graph_prefill_counters
+        ineligibility = self._cuda_graph_prefill_ineligibility(
+            scoped_hidden_states=scoped_hidden_states,
+            scoped_input_ids=scoped_input_ids,
+            scoped_attention_mask=scoped_attention_mask,
+            scoped_position_ids=scoped_position_ids,
+            scoped_keep_positions=scoped_keep_positions,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            capture_last_logit=capture_last_logit,
+            predictor_only=predictor_only,
+            enable_finalwipe=enable_finalwipe,
+            mid_pruning_layer_idx=mid_pruning_layer_idx,
+            wipe_layer_idx=wipe_layer_idx,
+            scoped_visual_tokens=scoped_visual_tokens,
+        )
+        if ineligibility is not None:
+            # Disabled/CPU/unsupported calls retain the authoritative eager
+            # implementation. On a CUDA callback-aware formal call, anything
+            # except an explicitly disabled switch is a visible protocol error.
+            if _enable_cuda_graph_prefill():
+                counters["eager_fallbacks"] += 1
+                counters["last_status"] = f"ineligible:{ineligibility}"
+                counters["last_error"] = None
+                if (
+                    self._cuda_graph_prefill_boundary_callbacks
+                    and scoped_hidden_states.is_cuda
+                ):
+                    raise RuntimeError(
+                        "Instrumented CUDA Graph prefill is ineligible: "
+                        f"{ineligibility}"
+                    )
+            return None
+
+        callback_aware = bool(
+            self._cuda_graph_prefill_boundary_callbacks
+        )
+        has_hooks = self._decoder_prefill_has_forward_hooks()
+        cache_key = self._cuda_graph_prefill_cache_key(
+            scoped_hidden_states=scoped_hidden_states,
+            scoped_input_ids=scoped_input_ids,
+            scoped_attention_mask=scoped_attention_mask,
+            scoped_position_ids=scoped_position_ids,
+            scoped_keep_positions=scoped_keep_positions,
+            mid_pruning_layer_idx=mid_pruning_layer_idx,
+            mid_scoring_layer_idx=mid_scoring_layer_idx,
+            wipe_layer_idx=wipe_layer_idx,
+            mid_attn_anchor=mid_attn_anchor,
+            mid_target_count=mid_target_count,
+            scoped_visual_tokens=scoped_visual_tokens,
+        )
+        cached = self._prefill_cuda_graph_runners.get(cache_key)
+
+        # Ordinary tracing hooks must observe eager module calls. The formal
+        # timer is explicitly callback-aware and may replay a warmed runner;
+        # it uses the callbacks because CUDA Graph replay bypasses Python hooks.
+        if has_hooks and not callback_aware:
+            counters["hook_fallbacks"] += 1
+            counters["eager_fallbacks"] += 1
+            counters["last_status"] = "eager_hook_fallback"
+            counters["last_error"] = None
+            return None
+
+        if cached is None:
+            counters["cache_misses"] += 1
+            if callback_aware:
+                counters["last_status"] = "instrumented_cache_miss"
+                raise RuntimeError(
+                    "Instrumented CUDA Graph prefill requires a warmed cache "
+                    "hit; capture/init is excluded from measurement"
+                )
+            if has_hooks:
+                counters["hook_fallbacks"] += 1
+                counters["eager_fallbacks"] += 1
+                counters["last_status"] = "capture_refused_with_hooks"
+                return None
+            self._cuda_graph_prefill_runner_sequence += 1
+            try:
+                cached = _ThreeSegmentPrefillCudaGraphRunner(
+                    self,
+                    scoped_hidden_states=scoped_hidden_states,
+                    scoped_input_ids=scoped_input_ids,
+                    scoped_attention_mask=scoped_attention_mask,
+                    scoped_position_ids=scoped_position_ids,
+                    scoped_keep_positions=scoped_keep_positions,
+                    mid_pruning_layer_idx=mid_pruning_layer_idx,
+                    mid_scoring_layer_idx=mid_scoring_layer_idx,
+                    wipe_layer_idx=wipe_layer_idx,
+                    mid_attn_anchor=mid_attn_anchor,
+                    mid_target_count=mid_target_count,
+                    runner_id=self._cuda_graph_prefill_runner_sequence,
+                )
+            except Exception as exc:
+                cached = exc
+                counters["capture_failures"] += 1
+                counters["eager_fallbacks"] += 1
+                counters["last_status"] = "capture_failure_fallback"
+                counters["last_error"] = repr(exc)
+            self._prefill_cuda_graph_runners[cache_key] = cached
+            capacity = max(
+                0,
+                _env_int(
+                    "LEARNABLE_PRUNE_CUDA_GRAPH_PREFILL_CACHE_SIZE",
+                    2,
+                ),
+            )
+            while len(self._prefill_cuda_graph_runners) > capacity:
+                self._prefill_cuda_graph_runners.popitem(last=False)
+                counters["evictions"] += 1
+            if isinstance(cached, _ThreeSegmentPrefillCudaGraphRunner):
+                counters["captures"] += 1
+                counters["total_capture_wall_ms"] += float(
+                    cached.capture_wall_ms
+                )
+                counters["total_initialization_wall_ms"] += float(
+                    cached.initialization_wall_ms
+                )
+        else:
+            counters["cache_hits"] += 1
+            self._prefill_cuda_graph_runners.move_to_end(cache_key)
+
+        if isinstance(cached, Exception):
+            counters["eager_fallbacks"] += int(
+                counters["last_status"] != "capture_failure_fallback"
+            )
+            counters["last_status"] = "cached_failure_fallback"
+            counters["last_error"] = repr(cached)
+            if callback_aware:
+                raise RuntimeError(
+                    "Instrumented CUDA Graph prefill hit a cached capture "
+                    f"failure: {cached!r}"
+                ) from cached
+            return None
+
+        try:
+            result = cached.run(
+                scoped_hidden_states=scoped_hidden_states,
+                scoped_input_ids=scoped_input_ids,
+                scoped_attention_mask=scoped_attention_mask,
+                scoped_position_ids=scoped_position_ids,
+                scoped_keep_positions=scoped_keep_positions,
+            )
+        except _CudaGraphPrefillBoundaryCallbackError as exc:
+            # Instrumentation is external to the replay runner. Surface the
+            # callback failure without replacing a healthy cached graph, so
+            # removing the callback makes that same runner immediately usable.
+            counters["last_status"] = "callback_failure"
+            counters["last_error"] = repr(exc.__cause__ or exc)
+            raise
+        except Exception as exc:
+            counters["replay_failures"] += 1
+            counters["last_status"] = "replay_failure"
+            counters["last_error"] = repr(exc)
+            if (
+                isinstance(exc, ValueError)
+                and "CUDA Graph prefill segment signature changed" in str(exc)
+            ):
+                # A stale or insufficiently specific signature must not poison
+                # this cache key forever. The current call remains visible as
+                # a failure/fallback, while a future uninstrumented call may
+                # capture the newly observed structural shape.
+                counters["signature_mismatches"] += 1
+                self._prefill_cuda_graph_runners.pop(cache_key, None)
+            else:
+                self._prefill_cuda_graph_runners[cache_key] = exc
+            if callback_aware:
+                raise
+            counters["eager_fallbacks"] += 1
+            return None
+        counters["replay_successes"] += 1
+        counters["last_status"] = (
+            "captured_then_replayed"
+            if counters["cache_misses"] > 0
+            and cached.replay_count == 1
+            else "cache_hit_replayed"
+        )
+        counters["last_runner_id"] = int(cached.runner_id)
+        counters["last_error"] = None
+        return result
 
     def _prefill_with_finalwipe(
         self,
@@ -1146,6 +2945,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         output_hidden_states: bool,
         attn_anchor: Optional[str] = None,
         mid_target_count: Optional[int] = None,
+        cuda_graph_last_logit: bool = False,
     ):
         profile_internal = _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False)
         profile_events: List[Tuple[str, torch.cuda.Event]] = []
@@ -1274,6 +3074,126 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             _env_flag("LEARNABLE_PRUNE_CACHED_BOOL_MASK", False)
             and attn_impl == "sdpa"
         )
+        mid_target_default = (
+            getattr(self, "learnable_prune_mid_target_count", MID_TARGET_COUNT)
+            if mid_target_count is None
+            else int(mid_target_count)
+        )
+        mid_target_count_value = _mid_target_count(mid_target_default)
+        scoped_visual_tokens = -1
+        if getattr(self, "learnable_prune_stats", None):
+            scoped_visual_tokens = int(
+                self.learnable_prune_stats[-1].get(
+                    "kept_visual_tokens",
+                    -1,
+                )
+            )
+
+        graph_prefill = self._try_cuda_graph_prefill(
+            scoped_hidden_states=inputs_embeds,
+            scoped_input_ids=scoped_input_ids,
+            scoped_attention_mask=attention_mask,
+            scoped_position_ids=position_ids,
+            scoped_keep_positions=scoped_keep_positions,
+            use_cache=bool(use_cache),
+            output_attentions=bool(output_attentions),
+            output_hidden_states=bool(output_hidden_states),
+            capture_last_logit=bool(cuda_graph_last_logit),
+            predictor_only=bool(predictor_only),
+            enable_finalwipe=bool(enable_finalwipe),
+            mid_pruning_layer_idx=int(mid_pruning_layer_idx),
+            mid_scoring_layer_idx=int(mid_scoring_layer_idx),
+            wipe_layer_idx=int(wipe_layer_idx),
+            mid_attn_anchor=mid_attn_anchor,
+            mid_target_count=int(mid_target_count_value),
+            scoped_visual_tokens=int(scoped_visual_tokens),
+        )
+        if graph_prefill is not None:
+            (
+                hidden_states,
+                next_cache,
+                graph_logits,
+                final_input_ids,
+                final_attention_mask,
+                final_keep_positions,
+                mid_query_count,
+                mid_visual_tokens,
+                mid_pruned_visual_tokens,
+                final_wiped_visual_tokens,
+            ) = graph_prefill
+            self._cuda_graph_prefill_logits = graph_logits
+            if getattr(self, "learnable_prune_stats", None):
+                stats = self.learnable_prune_stats[-1]
+                scope_visual_tokens = int(
+                    stats.get("scope_target_visual_tokens", 0)
+                )
+                avg_visual_tokens_budget = (
+                    mid_pruning_layer_idx * scope_visual_tokens
+                    + (wipe_layer_idx - mid_pruning_layer_idx)
+                    * mid_visual_tokens
+                ) / max(len(layers), 1)
+                self.learnable_prune_stats[-1].update(
+                    {
+                        "enable_finalwipe": True,
+                        "mid_pruning_layer_idx": int(
+                            mid_pruning_layer_idx
+                        ),
+                        "mid_scoring_layer_idx": int(
+                            mid_scoring_layer_idx
+                        ),
+                        "mid_attn_anchor": mid_attn_anchor,
+                        "mid_query_count": int(mid_query_count),
+                        "mid_target_visual_tokens": int(
+                            mid_visual_tokens
+                        ),
+                        "avg_visual_tokens_budget": float(
+                            avg_visual_tokens_budget
+                        ),
+                        "mid_pruned_visual_tokens": int(
+                            mid_pruned_visual_tokens
+                        ),
+                        "mid_sequence_tokens": int(
+                            attention_mask.shape[1]
+                            - mid_pruned_visual_tokens
+                        ),
+                        "final_wipe_layer_idx": int(wipe_layer_idx),
+                        "final_wipe_layer_idxs": [
+                            int(x) for x in final_wipe_layer_idxs
+                        ],
+                        "final_wiped_visual_tokens": int(
+                            final_wiped_visual_tokens
+                        ),
+                        "final_sequence_tokens": int(
+                            final_attention_mask.shape[1]
+                        ),
+                        "cuda_graph_prefill": True,
+                        "cuda_graph_prefill_runner_id": int(
+                            self._cuda_graph_prefill_counters[
+                                "last_runner_id"
+                            ]
+                        ),
+                    }
+                )
+                if os.environ.get(
+                    "LEARNABLE_PRUNE_DEBUG",
+                    "",
+                ).strip().lower() in {"1", "true", "yes", "on"}:
+                    print(
+                        "[learnable_prune_lightweight_scope_finalwipe] "
+                        f"stats={self.learnable_prune_stats[-1]}",
+                        flush=True,
+                    )
+            self._scope_finalwipe_applied = True
+            self._scope_finalwipe_next_position_id = int(input_ids.shape[1])
+            return (
+                hidden_states,
+                next_cache,
+                None,
+                None,
+                final_input_ids,
+                final_attention_mask,
+                final_keep_positions,
+            )
 
         pre_cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
         pre_mask = (
@@ -1322,12 +3242,6 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         else:
             mid_importance_scores = hidden_states.new_zeros((0,))
         mark_profile("mid_score")
-        mid_target_default = (
-            getattr(self, "learnable_prune_mid_target_count", MID_TARGET_COUNT)
-            if mid_target_count is None
-            else int(mid_target_count)
-        )
-        mid_target_count_value = _mid_target_count(mid_target_default)
         hidden_states, mid_input_ids, mid_attention_mask, mid_position_ids, mid_scoped_keep_positions = self._prune_by_mid_attention_scores(
             hidden_states=hidden_states,
             input_ids=scoped_input_ids,
@@ -1439,7 +3353,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 all_attns = all_attns + (attn,)
         mark_profile("late_layers")
 
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states = _apply_rms_norm(self.model.norm, hidden_states)
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         if next_cache is not None:
@@ -1506,6 +3420,7 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        self._cuda_graph_prefill_logits = None
 
         if inputs_embeds is None:
             inputs_embeds = self.get_model().embed_tokens(input_ids)
@@ -1547,6 +3462,11 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 output_hidden_states=bool(output_hidden_states),
                 attn_anchor=attn_anchor,
                 mid_target_count=mid_target_count,
+                cuda_graph_last_logit=(
+                    isinstance(logits_to_keep, int)
+                    and not isinstance(logits_to_keep, bool)
+                    and logits_to_keep == 1
+                ),
             )
         elif getattr(self, "_scope_finalwipe_applied", False) and past_key_values is not None:
             current_seq_len = inputs_embeds.shape[1]
@@ -1611,11 +3531,21 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
             all_hidden_states = outputs.hidden_states
             all_attns = outputs.attentions
 
-        if isinstance(logits_to_keep, int):
-            logits_hidden_states = hidden_states[:, -logits_to_keep:, :] if logits_to_keep > 0 else hidden_states
+        graph_prefill_logits = self._cuda_graph_prefill_logits
+        if (
+            should_prune
+            and torch.is_tensor(graph_prefill_logits)
+            and isinstance(logits_to_keep, int)
+            and not isinstance(logits_to_keep, bool)
+            and logits_to_keep == 1
+        ):
+            logits = graph_prefill_logits
         else:
-            logits_hidden_states = hidden_states[:, logits_to_keep, :]
-        logits = self.lm_head(logits_hidden_states)
+            if isinstance(logits_to_keep, int):
+                logits_hidden_states = hidden_states[:, -logits_to_keep:, :] if logits_to_keep > 0 else hidden_states
+            else:
+                logits_hidden_states = hidden_states[:, logits_to_keep, :]
+            logits = self.lm_head(logits_hidden_states)
         loss = None
         if not return_dict:
             output = (logits, past_key_values, all_hidden_states, all_attns)
@@ -1673,6 +3603,403 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 model_inputs["mid_target_count"] = mid_target_count
         return model_inputs
 
+    def _fixed_length_greedy_settings(self, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Validate the exact generation subset implemented by the fast path.
+
+        This intentionally accepts much less than ``GenerationMixin.generate``.
+        Unknown or behavior-changing arguments fall back to the upstream
+        implementation instead of being approximated here.
+        """
+        if self.training or not _enable_fixed_length_greedy():
+            return None
+
+        allowed_keys = {
+            "do_sample",
+            "num_beams",
+            "use_cache",
+            "max_new_tokens",
+            "min_new_tokens",
+            "pad_token_id",
+            "eos_token_id",
+            "num_return_sequences",
+            "return_dict_in_generate",
+            "output_scores",
+            "output_logits",
+            "output_attentions",
+            "output_hidden_states",
+            "synced_gpus",
+            "attn_anchor",
+            "mid_target_count",
+        }
+        if any(key not in allowed_keys for key in kwargs):
+            return None
+
+        # Requiring these values explicitly keeps the optimization independent
+        # of mutable GenerationConfig defaults.
+        required = {
+            "do_sample": False,
+            "num_beams": 1,
+            "use_cache": True,
+        }
+        for key, expected in required.items():
+            if key not in kwargs or kwargs[key] != expected:
+                return None
+
+        max_new_tokens = kwargs.get("max_new_tokens")
+        min_new_tokens = kwargs.get("min_new_tokens")
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, int)
+            or max_new_tokens <= 0
+            or min_new_tokens != max_new_tokens
+        ):
+            return None
+
+        generation_config = getattr(self, "generation_config", None)
+
+        def effective_value(name: str, default: Any) -> Any:
+            if name in kwargs:
+                return kwargs[name]
+            return getattr(generation_config, name, default)
+
+        if effective_value("num_return_sequences", 1) != 1:
+            return None
+        for name in (
+            "return_dict_in_generate",
+            "output_scores",
+            "output_logits",
+            "output_attentions",
+            "output_hidden_states",
+        ):
+            if bool(effective_value(name, False)):
+                return None
+        if effective_value("synced_gpus", False) not in (None, False):
+            return None
+
+        # These GenerationConfig options install additional processors,
+        # stopping criteria, cache implementations, or decoding algorithms.
+        # The fixed loop only reproduces greedy argmax plus the EOS suppression
+        # implied by min_new_tokens == max_new_tokens.
+        neutral_config = {
+            "max_time": None,
+            "stop_strings": None,
+            "cache_implementation": None,
+            "cache_config": None,
+            "prefill_chunk_size": None,
+            "repetition_penalty": 1.0,
+            "encoder_repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
+            "encoder_no_repeat_ngram_size": 0,
+            "bad_words_ids": None,
+            "renormalize_logits": False,
+            "forced_bos_token_id": None,
+            "forced_eos_token_id": None,
+            "remove_invalid_values": False,
+            "exponential_decay_length_penalty": None,
+            "suppress_tokens": None,
+            "begin_suppress_tokens": None,
+            "sequence_bias": None,
+            "token_healing": False,
+            "guidance_scale": None,
+            "watermarking_config": None,
+            "prompt_lookup_num_tokens": None,
+            "assistant_early_exit": None,
+            "penalty_alpha": None,
+            "dola_layers": None,
+            "diversity_penalty": 0.0,
+            "num_beam_groups": 1,
+            "constraints": None,
+            "force_words_ids": None,
+        }
+        if generation_config is not None:
+            for name, expected in neutral_config.items():
+                if getattr(generation_config, name, expected) != expected:
+                    return None
+
+        pad_token_id = effective_value("pad_token_id", None)
+        if pad_token_id is not None and (
+            isinstance(pad_token_id, bool) or not isinstance(pad_token_id, int)
+        ):
+            return None
+
+        eos_token_id = effective_value("eos_token_id", None)
+        if eos_token_id is None:
+            eos_token_ids: Tuple[int, ...] = ()
+        elif isinstance(eos_token_id, int) and not isinstance(eos_token_id, bool):
+            eos_token_ids = (int(eos_token_id),)
+        elif isinstance(eos_token_id, (list, tuple)) and all(
+            isinstance(token_id, int) and not isinstance(token_id, bool)
+            for token_id in eos_token_id
+        ):
+            eos_token_ids = tuple(int(token_id) for token_id in eos_token_id)
+        else:
+            return None
+        if any(token_id < 0 or token_id >= int(self.vocab_size) for token_id in eos_token_ids):
+            return None
+
+        attn_anchor = kwargs.get("attn_anchor")
+        if attn_anchor is None:
+            attn_anchor = MID_ATTN_ANCHOR
+        return {
+            "max_new_tokens": int(max_new_tokens),
+            "eos_token_ids": eos_token_ids,
+            "attn_anchor": attn_anchor,
+            "mid_target_count": kwargs.get("mid_target_count"),
+        }
+
+    @staticmethod
+    def _fixed_length_greedy_next_token(
+        logits: torch.Tensor,
+        eos_token_ids: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Match greedy argmax while min-new-token processing suppresses EOS."""
+        if eos_token_ids:
+            logits = logits.clone()
+            logits[..., list(eos_token_ids)] = float("-inf")
+        # GenerationMixin casts model logits to fp32 before argmax. BF16/FP16
+        # values are represented exactly after that cast, so their ordering and
+        # tie-breaking are unchanged by taking argmax directly.
+        return torch.argmax(logits, dim=-1)
+
+    def _try_fixed_length_cuda_graph_decode(
+        self,
+        *,
+        source_cache: Cache,
+        first_token: torch.Tensor,
+        max_new_tokens: int,
+        original_sequence_length: int,
+        eos_token_ids: Tuple[int, ...],
+    ) -> Optional[torch.Tensor]:
+        if (
+            not _enable_cuda_graph_decode()
+            or self.training
+            or torch.is_grad_enabled()
+            or max_new_tokens <= 1
+            or max_new_tokens > 64
+            or not torch.cuda.is_available()
+            or not first_token.is_cuda
+            or first_token.shape != (1,)
+            or first_token.dtype != torch.long
+            or not isinstance(source_cache, Cache)
+            or len(source_cache) != len(self.model.layers)
+            or str(getattr(self.model.config, "_attn_implementation", "eager"))
+            != "sdpa"
+            or not _env_flag("LEARNABLE_PRUNE_DIRECT_SDPA", True)
+        ):
+            return None
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            source_signature = _FixedGreedyCudaGraphRunner.cache_signature(
+                source_cache
+            )
+        except Exception:
+            return None
+
+        for layer_idx in range(len(source_cache)):
+            keys, values = source_cache[layer_idx]
+            if (
+                keys.shape != values.shape
+                or keys.ndim != 4
+                or keys.shape[0] != 1
+                or keys.shape[-2] <= 0
+                or keys.dtype not in {torch.bfloat16, torch.float16}
+                or values.dtype != keys.dtype
+                or not keys.is_cuda
+                or not values.is_cuda
+                or keys.device != first_token.device
+                or values.device != first_token.device
+                or not keys.is_contiguous()
+                or not values.is_contiguous()
+            ):
+                return None
+
+        cache_key = (
+            int(max_new_tokens),
+            int(original_sequence_length),
+            tuple(int(token_id) for token_id in eos_token_ids),
+            source_signature,
+        )
+        cached = self._fixed_greedy_cuda_graph_runners.get(cache_key)
+        if isinstance(cached, Exception):
+            return None
+        if cached is None:
+            try:
+                cached = _FixedGreedyCudaGraphRunner(
+                    self,
+                    source_cache,
+                    max_new_tokens=max_new_tokens,
+                    original_sequence_length=original_sequence_length,
+                    eos_token_ids=eos_token_ids,
+                    first_token=first_token,
+                )
+            except Exception as exc:
+                self._fixed_greedy_cuda_graph_runners[cache_key] = exc
+                if _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False):
+                    print(
+                        "[learnable_prune_decode_graph] "
+                        f"capture failed: {exc!r}",
+                        flush=True,
+                    )
+                return None
+            self._fixed_greedy_cuda_graph_runners[cache_key] = cached
+            while len(self._fixed_greedy_cuda_graph_runners) > 1:
+                self._fixed_greedy_cuda_graph_runners.popitem(last=False)
+        else:
+            self._fixed_greedy_cuda_graph_runners.move_to_end(cache_key)
+
+        try:
+            return cached.run(source_cache, first_token)
+        except Exception as exc:
+            # Instrumentation failures must remain visible; silently rerunning
+            # eager would produce duplicate or incomplete boundary events.
+            if self._cuda_graph_decode_boundary_callbacks:
+                raise
+            self._fixed_greedy_cuda_graph_runners[cache_key] = exc
+            if _env_flag("LEARNABLE_PRUNE_PROFILE_INTERNAL", False):
+                print(
+                    "[learnable_prune_decode_graph] "
+                    f"replay failed: {exc!r}",
+                    flush=True,
+                )
+            return None
+
+    @torch.no_grad()
+    def _fixed_length_greedy_generate(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        expanded_input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        visual_coordinates: Optional[torch.Tensor],
+        settings: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Run the fixed greedy loop inside the non-escaping graph context."""
+        context_token = _CUDA_GRAPH_PREFILL_GENERATION_OWNER.set(id(self))
+        try:
+            return self._fixed_length_greedy_generate_impl(
+                inputs_embeds=inputs_embeds,
+                expanded_input_ids=expanded_input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                visual_coordinates=visual_coordinates,
+                settings=settings,
+            )
+        finally:
+            _CUDA_GRAPH_PREFILL_GENERATION_OWNER.reset(context_token)
+
+    def _fixed_length_greedy_generate_impl(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        expanded_input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        visual_coordinates: Optional[torch.Tensor],
+        settings: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Generate an exact fixed number of greedy tokens without host syncs."""
+        outputs = self.forward(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            logits_to_keep=1,
+            learnable_prune_input_ids=expanded_input_ids,
+            learnable_prune_visual_coordinates=visual_coordinates,
+            attn_anchor=settings["attn_anchor"],
+            mid_target_count=settings["mid_target_count"],
+        )
+        past_key_values = outputs.past_key_values
+        if not isinstance(past_key_values, Cache):
+            raise RuntimeError("Fixed-length greedy generation requires a Transformers Cache")
+
+        max_new_tokens = int(settings["max_new_tokens"])
+        eos_token_ids = tuple(settings["eos_token_ids"])
+        original_sequence_length = int(expanded_input_ids.shape[1])
+        final_layer_idx = len(self.model.layers) - 1
+        final_cache_length = int(past_key_values.get_seq_length(final_layer_idx))
+        decode_steps = max(0, max_new_tokens - 1)
+        rope_positions = torch.arange(
+            original_sequence_length,
+            original_sequence_length + decode_steps,
+            device=inputs_embeds.device,
+            dtype=torch.long,
+        )
+        physical_cache_positions = torch.arange(
+            final_cache_length,
+            final_cache_length + decode_steps,
+            device=inputs_embeds.device,
+            dtype=torch.long,
+        )
+        decode_cache: Cache = past_key_values
+        if decode_steps > 0 and _enable_static_kv_decode():
+            try:
+                decode_cache = _HeterogeneousStaticCache.from_cache(
+                    past_key_values,
+                    max_decode_steps=decode_steps,
+                )
+            except Exception:
+                # This validation path is optional. Any cache signature not
+                # covered by the exact batch-one specialization keeps the
+                # authoritative DynamicCache behavior.
+                decode_cache = past_key_values
+
+        logits = outputs.logits[:, -1, :]
+        first_token = self._fixed_length_greedy_next_token(
+            logits,
+            eos_token_ids,
+        )
+        graph_tokens = self._try_fixed_length_cuda_graph_decode(
+            source_cache=past_key_values,
+            first_token=first_token,
+            max_new_tokens=max_new_tokens,
+            original_sequence_length=original_sequence_length,
+            eos_token_ids=eos_token_ids,
+        )
+        if graph_tokens is not None:
+            self._scope_finalwipe_next_position_id = (
+                original_sequence_length + decode_steps
+            )
+            return graph_tokens
+
+        generated_tokens: List[torch.Tensor] = []
+        for step in range(max_new_tokens):
+            next_token = self._fixed_length_greedy_next_token(logits, eos_token_ids)
+            generated_tokens.append(next_token.unsqueeze(1))
+            if step + 1 == max_new_tokens:
+                break
+
+            token_embeds = self.get_model().embed_tokens(next_token.unsqueeze(1))
+            decode_position_ids = rope_positions[step : step + 1].unsqueeze(0)
+            decode_cache_position = physical_cache_positions[step : step + 1]
+            if isinstance(decode_cache, _HeterogeneousStaticCache):
+                decode_cache.set_decode_step(step)
+            hidden_states, decode_cache, _, _ = self._manual_decode(
+                inputs_embeds=token_embeds,
+                attention_mask=None,
+                position_ids=decode_position_ids,
+                past_key_values=decode_cache,
+                cache_position=decode_cache_position,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            logits = self.lm_head(hidden_states[:, -1:, :])[:, -1, :]
+
+        # Preserve the state that the regular decode forwards would leave
+        # behind, even though normal independent generate calls reset it.
+        self._scope_finalwipe_next_position_id = (
+            original_sequence_length + max(0, max_new_tokens - 1)
+        )
+        return torch.cat(generated_tokens, dim=1)
+
     @torch.no_grad()
     def generate(
         self,
@@ -1700,6 +4027,22 @@ class LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM(LlavaLlamaForCausa
                 position_ids,
                 image_sizes=image_sizes,
             )
+            fixed_settings = self._fixed_length_greedy_settings(kwargs)
+            if (
+                fixed_settings is not None
+                and inputs_embeds.shape[0] == 1
+                and torch.is_tensor(images)
+                and images.ndim == 4
+                and images.shape[0] == 1
+            ):
+                return self._fixed_length_greedy_generate(
+                    inputs_embeds=inputs_embeds,
+                    expanded_input_ids=expanded_input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    visual_coordinates=visual_coordinates,
+                    settings=fixed_settings,
+                )
             return LlamaForCausalLM.generate(
                 self,
                 position_ids=position_ids,
